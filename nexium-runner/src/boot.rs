@@ -99,6 +99,22 @@ fn cpu_slice_cycles() -> u64 {
     })
 }
 
+fn stop_on_aux_stall(
+    event: nexium_core::cpu::CpuEvent,
+    emulation_stop: &AtomicBool,
+    auxiliary_stop: &AtomicBool,
+    first_stop: impl FnOnce(),
+) -> bool {
+    if !matches!(event, nexium_core::cpu::CpuEvent::Stalled) {
+        return false;
+    }
+    auxiliary_stop.store(true, Ordering::Release);
+    if !emulation_stop.swap(true, Ordering::AcqRel) {
+        first_stop();
+    }
+    true
+}
+
 fn core_park_enabled() -> bool {
     static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| std::env::var("NEXIUM_CORE_PARK").ok().as_deref() != Some("0"))
@@ -143,7 +159,7 @@ fn hos_preemption_order_enabled() -> bool {
     *VALUE.get_or_init(|| std::env::var("NEXIUM_HOS_PREEMPT_ORDER").ok().as_deref() == Some("1"))
 }
 
-fn sync_host_region_changes(
+pub fn sync_host_region_changes(
     cpu: &mut nexium_core::cpu::Cpu,
     address_space: &nexium_memory::AddressSpace,
     last_generation: &mut u64,
@@ -904,6 +920,8 @@ impl EmulationHandle {
                     for core_id in 1..active_cores {
                         let kernel_aux = Arc::clone(&boot_ctx.kernel);
                         let stop_aux = Arc::clone(&aux_core_stop);
+                        let emulation_stop_aux = Arc::clone(&stop_flag_clone);
+                        let halt_main_aux = halt.clone();
                         let pause_aux = Arc::clone(&pause_flag_clone);
                         let backend_aux = cpu_backend;
                         let addr_aux = Arc::clone(&boot_ctx.address_space);
@@ -971,6 +989,7 @@ impl EmulationHandle {
                                         }
                                         continue;
                                     }
+                                    let execution_guard = addr_aux.execution_guard();
                                     let gen = addr_aux.generation();
                                     if gen != last_map_gen {
                                         if let Err(error) = sync_host_region_changes(
@@ -983,8 +1002,55 @@ impl EmulationHandle {
                                         }
                                     }
                                     let run = cpu_mut().unwrap().run_with_count(200_000);
+                                    if aux_faults < 4 {
+                                        let cpu = cpu_ref().unwrap();
+                                        if let Some(fault) = cpu.take_fault() {
+                                            let host = addr_aux.host_region_at(fault.addr);
+                                            let mut bytes = [0u8; 16];
+                                            let width = (fault.size as usize).min(bytes.len());
+                                            let cpu_read_ok = cpu.read_bytes(fault.addr, &mut bytes[..width]).is_ok();
+                                            let live_read_ok = addr_aux.read(fault.addr, &mut bytes[..width]).is_ok();
+                                            log::warn!(
+                                                "[core{}-guest-fault-map] addr={:#x} cpu_generation={} live_generation={} cpu_read_ok={} live_read_ok={} host_region={:?}",
+                                                core_id, fault.addr, last_map_gen, addr_aux.generation(), cpu_read_ok, live_read_ok,
+                                                host.map(|region| (region.base, region.size, region.perm))
+                                            );
+                                            log::warn!(
+                                                "[core{}-guest-fault-registers] pc={:#x} addr={:#x} size={} write={} lr={:#x} sp={:#x} x0..x30={:x?}",
+                                                core_id, fault.pc, fault.addr, fault.size, fault.is_write, fault.lr, fault.sp, fault.regs
+                                            );
+                                            if std::env::var_os("NEXIUM_FAULT_CONTEXT").is_some() {
+                                                for (reg, &address) in fault.regs.iter().enumerate() {
+                                                    let mut head = [0u8; 32];
+                                                    if address >= 0x1_0000 && addr_aux.read(address, &mut head).is_ok() {
+                                                        log::warn!(
+                                                            "[core{}-guest-fault-context] mem@X{}({:#x})[0..32]={:02x?}",
+                                                            core_id, reg, address, head
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    drop(execution_guard);
                                     let event = run.event;
                                     aux_cycles = aux_cycles.saturating_add(run.retired);
+                                    if stop_on_aux_stall(event, &emulation_stop_aux, &stop_aux, || {
+                                        let cpu = cpu_ref().unwrap();
+                                        log::error!(
+                                            "[core{}] CPU stalled at pc={:#x} lr={:#x} sp={:#x} retired={}; stopping emulation",
+                                            core_id,
+                                            cpu.get_pc(),
+                                            cpu.get_register(30),
+                                            cpu.get_sp(),
+                                            run.retired,
+                                        );
+                                        if let Some(halt) = &halt_main_aux {
+                                            halt.halt();
+                                        }
+                                    }) {
+                                        break;
+                                    }
                                     if core_status_enabled()
                                         && aux_status.elapsed() >= std::time::Duration::from_secs(5)
                                     {
@@ -1562,6 +1628,7 @@ impl EmulationHandle {
                         let pc_before = cpu.get_pc();
                         let cpu_slice = cpu_slice_cycles();
                         drop(guard);
+                        let execution_guard = boot_ctx.address_space.execution_guard();
                         let gen = boot_ctx.address_space.generation();
                         if gen != last_map_gen0 {
                             if let Err(error) = sync_host_region_changes(
@@ -1579,6 +1646,16 @@ impl EmulationHandle {
                         if skipped_fault_logs < 8 {
                             if let Some(fault) = cpu.take_fault() {
                                 skipped_fault_logs += 1;
+                                let host = boot_ctx.address_space.host_region_at(fault.addr);
+                                let mut bytes = [0u8; 16];
+                                let width = (fault.size as usize).min(bytes.len());
+                                let cpu_read_ok = cpu.read_bytes(fault.addr, &mut bytes[..width]).is_ok();
+                                let live_read_ok = boot_ctx.address_space.read(fault.addr, &mut bytes[..width]).is_ok();
+                                log::warn!(
+                                    "[guest-fault-map] addr={:#x} cpu_generation={} live_generation={} cpu_read_ok={} live_read_ok={} host_region={:?}",
+                                    fault.addr, last_map_gen0, boot_ctx.address_space.generation(), cpu_read_ok, live_read_ok,
+                                    host.map(|region| (region.base, region.size, region.perm))
+                                );
                                 log::warn!(
                                     "[guest-fault] skipped {} at pc={:#x} addr={:#x} lr={:#x} sp={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x8={:#x}",
                                     if fault.is_write { "write" } else { "read" },
@@ -1592,8 +1669,14 @@ impl EmulationHandle {
                                     fault.regs[3],
                                     fault.regs[8]
                                 );
+                                log::warn!(
+                                    "[guest-fault-registers] pc={:#x} x0..x30={:x?}",
+                                    fault.pc,
+                                    fault.regs
+                                );
                             }
                         }
+                        drop(execution_guard);
                         if core_status_enabled()
                             && last_status.elapsed() >= std::time::Duration::from_secs(5)
                         {
@@ -2473,6 +2556,86 @@ impl Drop for EmulationHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auxiliary_stall_policy_preserves_nonfatal_cpu_events() {
+        use nexium_core::cpu::CpuEvent;
+        for event in [
+            CpuEvent::Running,
+            CpuEvent::Interrupted,
+            CpuEvent::Svc(0x21),
+            CpuEvent::Exception(0x0e),
+        ] {
+            let emulation_stop = AtomicBool::new(false);
+            let auxiliary_stop = AtomicBool::new(false);
+            assert!(!stop_on_aux_stall(
+                event,
+                &emulation_stop,
+                &auxiliary_stop,
+                || panic!("nonfatal event requested a diagnostic/halt"),
+            ));
+            assert!(!emulation_stop.load(Ordering::Acquire));
+            assert!(!auxiliary_stop.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn auxiliary_stall_requests_shared_stop_and_halt_only_once() {
+        let emulation_stop = AtomicBool::new(false);
+        let auxiliary_stop = AtomicBool::new(false);
+        let first_stop_count = AtomicU64::new(0);
+        for _ in 0..2 {
+            assert!(stop_on_aux_stall(
+                nexium_core::cpu::CpuEvent::Stalled,
+                &emulation_stop,
+                &auxiliary_stop,
+                || {
+                    assert!(emulation_stop.load(Ordering::Acquire));
+                    assert!(auxiliary_stop.load(Ordering::Acquire));
+                    first_stop_count.fetch_add(1, Ordering::Relaxed);
+                },
+            ));
+        }
+        assert_eq!(first_stop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn auxiliary_stall_still_stops_auxiliary_cores_after_a_shared_stop_request() {
+        let emulation_stop = AtomicBool::new(true);
+        let auxiliary_stop = AtomicBool::new(false);
+        assert!(stop_on_aux_stall(
+            nexium_core::cpu::CpuEvent::Stalled,
+            &emulation_stop,
+            &auxiliary_stop,
+            || panic!("an existing shared stop request must not emit a second diagnostic/halt"),
+        ));
+        assert!(emulation_stop.load(Ordering::Acquire));
+        assert!(auxiliary_stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn auxiliary_stall_elects_one_stop_across_concurrent_cores() {
+        let emulation_stop = AtomicBool::new(false);
+        let auxiliary_stop = AtomicBool::new(false);
+        let first_stop_count = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    assert!(stop_on_aux_stall(
+                        nexium_core::cpu::CpuEvent::Stalled,
+                        &emulation_stop,
+                        &auxiliary_stop,
+                        || {
+                            first_stop_count.fetch_add(1, Ordering::Relaxed);
+                        },
+                    ));
+                });
+            }
+        });
+        assert!(emulation_stop.load(Ordering::Acquire));
+        assert!(auxiliary_stop.load(Ordering::Acquire));
+        assert_eq!(first_stop_count.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn full_frame_channel_keeps_the_pending_frame_for_retry() {
