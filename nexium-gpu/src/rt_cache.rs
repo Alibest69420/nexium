@@ -1499,7 +1499,22 @@ impl RtCache {
         &mut self,
         device: &ash::Device,
         key: RtKey,
+        retired: &mut Vec<GpuImage>,
     ) -> Result<(vk::Image, vk::ImageView, vk::Format), String> {
+        self.get_or_create_feedback_snapshot_with(key, retired, |cache, native_format| {
+            cache.create_image(device, key, native_format)
+        })
+    }
+
+    fn get_or_create_feedback_snapshot_with<F>(
+        &mut self,
+        key: RtKey,
+        retired: &mut Vec<GpuImage>,
+        create_image: F,
+    ) -> Result<(vk::Image, vk::ImageView, vk::Format), String>
+    where
+        F: FnOnce(&Self, vk::Format) -> Result<GpuImage, String>,
+    {
         let (native_format, extent) = {
             let live = self
                 .cache
@@ -1516,9 +1531,9 @@ impl RtCache {
             None => true,
         };
         if recreate {
-            let img = self.create_image(device, key, native_format)?;
+            let img = create_image(self, native_format)?;
             if let Some(old) = self.snapshots.insert(key, img) {
-                destroy_gpu_image(device, old);
+                retired.push(old);
             }
         }
         let snap = self.snapshots.get(&key).unwrap();
@@ -5025,6 +5040,198 @@ mod tests {
             extent: vk::Extent2D { width: key.width, height: key.height },
             ..test_color_image(vk::Format::R8G8B8A8_UNORM, vk::Format::R8G8B8A8_UNORM)
         }
+    }
+
+    fn feedback_snapshot_test_image(key: RtKey, handle: u64, format: vk::Format) -> GpuImage {
+        let view = vk::ImageView::from_raw(handle + 0x1000);
+        let sample_key = RtSampleViewKey::new(
+            format,
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageViewType::TYPE_2D,
+            vk::ComponentMapping::default(),
+        );
+        GpuImage {
+            image: vk::Image::from_raw(handle),
+            view,
+            views: HashMap::from([(format, view)]),
+            sample_views: [
+                (sample_key, vk::ImageView::from_raw(handle + 0x3000)),
+            ].into_iter().collect(),
+            memory: vk::DeviceMemory::from_raw(handle + 0x2000),
+            format,
+            base_format: format,
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            ..retirement_color(key, handle)
+        }
+    }
+
+    fn assert_feedback_snapshot_test_image(image: &GpuImage, handle: u64, format: vk::Format) {
+        assert_eq!(image.image, vk::Image::from_raw(handle));
+        assert_eq!(image.view, vk::ImageView::from_raw(handle + 0x1000));
+        assert_eq!(image.memory, vk::DeviceMemory::from_raw(handle + 0x2000));
+        assert_eq!(image.format, format);
+        assert_eq!(image.base_format, format);
+        assert_eq!(image.layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        assert_eq!(image.views.len(), 1);
+        assert_eq!(image.views[&format], image.view);
+        assert_eq!(image.sample_views.len(), 1);
+        assert_eq!(
+            image.sample_views.values().copied().next(),
+            Some(vk::ImageView::from_raw(handle + 0x3000)),
+        );
+    }
+
+    #[test]
+    fn feedback_snapshot_first_allocation_and_reuse_do_not_retire_resources() {
+        let mut cache = RtCache::new();
+        let key = retirement_key(32, 32);
+        let format = vk::Format::R8G8B8A8_UNORM;
+        cache.insert_color_image(key, feedback_snapshot_test_image(key, 90, format));
+        let mut retired = vec![feedback_snapshot_test_image(key, 99, format)];
+        let expected = (vk::Image::from_raw(1), vk::ImageView::from_raw(0x1001), format);
+        let result = cache.get_or_create_feedback_snapshot_with(
+            key,
+            &mut retired,
+            |cache, native_format| {
+                assert_eq!(native_format, format);
+                assert!(!cache.snapshots.contains_key(&key));
+                Ok(feedback_snapshot_test_image(key, 1, native_format))
+            },
+        ).unwrap();
+        assert_eq!(result, expected);
+        assert_eq!(retired.len(), 1);
+        assert_feedback_snapshot_test_image(&retired[0], 99, format);
+
+        assert_eq!(cache.get_or_create_feedback_snapshot_with(
+            key,
+            &mut retired,
+            |_, _| panic!("an unchanged snapshot must not allocate"),
+        ).unwrap(), expected);
+        assert_eq!(retired.len(), 1);
+        assert_feedback_snapshot_test_image(&cache.snapshots[&key], 1, format);
+    }
+
+    #[test]
+    fn feedback_snapshot_format_replacement_retires_complete_old_resource() {
+        let mut cache = RtCache::new();
+        let key = retirement_key(32, 32);
+        let old_format = vk::Format::R8G8B8A8_UNORM;
+        let new_format = vk::Format::R16G16B16A16_SFLOAT;
+        assert!(!rt_formats_compatible(old_format, new_format));
+        cache.insert_color_image(key, feedback_snapshot_test_image(key, 90, new_format));
+        cache.snapshots.insert(key, feedback_snapshot_test_image(key, 1, old_format));
+        let mut retired = vec![feedback_snapshot_test_image(key, 99, old_format)];
+
+        let result = cache.get_or_create_feedback_snapshot_with(
+            key,
+            &mut retired,
+            |cache, native_format| {
+                assert_feedback_snapshot_test_image(&cache.snapshots[&key], 1, old_format);
+                assert_eq!(native_format, new_format);
+                Ok(feedback_snapshot_test_image(key, 2, native_format))
+            },
+        ).unwrap();
+        assert_eq!(result, (vk::Image::from_raw(2), vk::ImageView::from_raw(0x1002), new_format));
+        assert_eq!(retired.len(), 2);
+        assert_feedback_snapshot_test_image(&retired[0], 99, old_format);
+        assert_feedback_snapshot_test_image(&retired[1], 1, old_format);
+        assert_feedback_snapshot_test_image(&cache.snapshots[&key], 2, new_format);
+    }
+
+    #[test]
+    fn feedback_snapshot_extent_replacement_retires_old_resource() {
+        for old_extent in [
+            vk::Extent2D { width: 16, height: 32 },
+            vk::Extent2D { width: 32, height: 16 },
+        ] {
+            let mut cache = RtCache::new();
+            let key = retirement_key(32, 32);
+            let format = vk::Format::R8G8B8A8_UNORM;
+            cache.insert_color_image(key, feedback_snapshot_test_image(key, 90, format));
+            let mut old = feedback_snapshot_test_image(key, 1, format);
+            old.extent = old_extent;
+            cache.snapshots.insert(key, old);
+            let mut retired = Vec::new();
+            cache.get_or_create_feedback_snapshot_with(key, &mut retired, |_, native_format| {
+                assert_eq!(native_format, format);
+                Ok(feedback_snapshot_test_image(key, 2, format))
+            }).unwrap();
+            assert_eq!(retired.len(), 1);
+            assert_feedback_snapshot_test_image(&retired[0], 1, format);
+            assert_eq!(retired[0].extent, old_extent);
+            assert_eq!(cache.snapshots[&key].extent, vk::Extent2D { width: 32, height: 32 });
+        }
+    }
+
+    #[test]
+    fn feedback_snapshot_failed_replacement_preserves_old_resource_and_retirement() {
+        let mut cache = RtCache::new();
+        let key = retirement_key(32, 32);
+        let old_format = vk::Format::R8G8B8A8_UNORM;
+        let new_format = vk::Format::R16G16B16A16_SFLOAT;
+        cache.insert_color_image(key, feedback_snapshot_test_image(key, 90, new_format));
+        cache.snapshots.insert(key, feedback_snapshot_test_image(key, 1, old_format));
+        let mut retired = vec![feedback_snapshot_test_image(key, 99, old_format)];
+        let result = cache.get_or_create_feedback_snapshot_with(key, &mut retired, |_, format| {
+            assert_eq!(format, new_format);
+            Err("injected snapshot allocation failure".to_string())
+        });
+        assert_eq!(result, Err("injected snapshot allocation failure".to_string()));
+        assert_eq!(retired.len(), 1);
+        assert_feedback_snapshot_test_image(&retired[0], 99, old_format);
+        assert_feedback_snapshot_test_image(&cache.snapshots[&key], 1, old_format);
+    }
+
+    #[test]
+    fn feedback_snapshot_missing_live_image_preserves_ownership_without_allocating() {
+        let mut cache = RtCache::new();
+        let key = retirement_key(32, 32);
+        let format = vk::Format::R8G8B8A8_UNORM;
+        cache.snapshots.insert(key, feedback_snapshot_test_image(key, 1, format));
+        let mut retired = vec![feedback_snapshot_test_image(key, 99, format)];
+        let result = cache.get_or_create_feedback_snapshot_with(key, &mut retired, |_, _| {
+            panic!("a missing live image must not allocate");
+        });
+        assert!(result.unwrap_err().contains("no live image"));
+        assert_eq!(retired.len(), 1);
+        assert_feedback_snapshot_test_image(&retired[0], 99, format);
+        assert_feedback_snapshot_test_image(&cache.snapshots[&key], 1, format);
+    }
+
+    #[test]
+    fn feedback_snapshot_repeated_replacement_and_view_retirement_retain_each_image_once() {
+        let mut cache = RtCache::new();
+        let key = retirement_key(32, 32);
+        let formats = [
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::Format::R32G32B32A32_SFLOAT,
+        ];
+        cache.insert_color_image(key, feedback_snapshot_test_image(key, 90, formats[0]));
+        cache.snapshots.insert(key, feedback_snapshot_test_image(key, 1, formats[0]));
+        let mut retired = Vec::new();
+        for (index, &format) in formats.iter().enumerate().skip(1) {
+            let live = cache.cache.get_mut(&key).unwrap();
+            live.base_format = format;
+            live.format = format;
+            let handle = index as u64 + 1;
+            cache.get_or_create_feedback_snapshot_with(key, &mut retired, |_, native_format| {
+                assert_eq!(native_format, format);
+                Ok(feedback_snapshot_test_image(key, handle, format))
+            }).unwrap();
+            assert_eq!(retired.len(), index);
+            for (old_index, image) in retired.iter().enumerate() {
+                assert_feedback_snapshot_test_image(image, old_index as u64 + 1, formats[old_index]);
+            }
+        }
+        assert_eq!(cache.retire_view(false, key, &mut retired).0, 2);
+        assert!(!cache.snapshots.contains_key(&key));
+        assert!(!cache.cache.contains_key(&key));
+        assert_eq!(retired.len(), 4);
+        for (index, &format) in formats.iter().enumerate() {
+            assert_feedback_snapshot_test_image(&retired[index], index as u64 + 1, format);
+        }
+        assert_eq!(retired[3].image, vk::Image::from_raw(90));
     }
 
     fn retire_aged_views(cache: &mut RtCache, retired: &mut Vec<GpuImage>, protected: &[RtKey]) -> (usize, u64) {

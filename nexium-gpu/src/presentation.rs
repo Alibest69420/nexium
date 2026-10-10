@@ -924,7 +924,6 @@ impl Worker {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             let state = *self.target.state.lock();
-            let mut pending_release = None;
             if let Some(slot) = incoming.take() {
                 let started = present_profile_enabled().then(Instant::now);
                 unsafe {
@@ -935,8 +934,7 @@ impl Worker {
                 if let Some(started) = started {
                     PRESENT_PROFILE.fence.add(started.elapsed());
                 }
-                if let Some(mut previous) = self.last.replace(slot) {
-                    pending_release = previous.release.take();
+                if let Some(previous) = self.last.replace(slot) {
                     PRESENT_SLOTS_OUT.fetch_sub(1, Ordering::Relaxed);
                     let _ = recycle.send(previous);
                 }
@@ -952,10 +950,9 @@ impl Worker {
                 (self.target.repaint)();
                 if state.visible && state.width != 0 && state.height != 0 {
                     self.present(state)?;
-                } else {
-                    self.wait_present_time(self.last.as_ref().unwrap().parameters.present_at);
                 }
-                drop(pending_release);
+                self.wait_present_time(self.last.as_ref().unwrap().parameters.present_at);
+                drop(self.last.as_mut().unwrap().release.take());
             } else if self.last.is_some()
                 && state.visible
                 && state.width != 0

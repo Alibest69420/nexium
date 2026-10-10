@@ -34,6 +34,14 @@ impl ApplicationHandler for Events {
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
 }
 
+struct ReleaseCanary(Arc<Mutex<Vec<Instant>>>);
+
+impl Drop for ReleaseCanary {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().push(Instant::now());
+    }
+}
+
 fn pump_until(event_loop: &mut EventLoop<()>, mut done: impl FnMut() -> bool) {
     let started = Instant::now();
     while !done() {
@@ -133,15 +141,75 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
     assert!(!renderer
         .present_image(key, stamp + 1, false, parameters, None)
         .unwrap());
+    window.set_visible(true);
+    target.configure(SurfaceState {
+        width: 320,
+        height: 180,
+        visible: true,
+        vsync: false,
+        filter: ScalingFilter::Nearest,
+        sharpness: 87,
+    });
+    let released_at = Arc::new(Mutex::new(Vec::new()));
+    let first_deadline = Instant::now() + Duration::from_millis(200);
     assert!(renderer
-        .present_image(key, stamp, false, parameters, None)
+        .present_image(
+            key,
+            stamp,
+            false,
+            PresentParameters {
+                present_at: first_deadline,
+                ..parameters
+            },
+            Some(Box::new(ReleaseCanary(released_at.clone()))),
+        )
         .unwrap());
-    pump_until(&mut event_loop, || target.progress().0 >= 1);
+    pump_until(&mut event_loop, || {
+        let times = released_at.lock().unwrap().clone();
+        assert!(
+            times.iter().all(|time| *time >= first_deadline),
+            "guest buffer released before its own presentation deadline"
+        );
+        !times.is_empty()
+    });
+    assert_eq!(released_at.lock().unwrap().len(), 1);
+    assert_eq!(target.progress().0, 1);
     assert_eq!(target.metrics().2, 0);
-    assert_eq!(target.metrics().1, 0);
+    assert!(target.metrics().1 >= 1);
+
+    let overwritten = [0, 255, 0, 255].repeat(16 * 8);
+    renderer
+        .upload_target_rgba(1, 16, 8, 0x10000, &overwritten)
+        .unwrap();
+    target.request_snapshot();
+    let mut retained = None;
+    pump_until(&mut event_loop, || {
+        retained = target.take_snapshot();
+        retained.is_some()
+    });
+    let retained = retained.unwrap();
+    assert_eq!((retained.width, retained.height), (16, 8));
+    assert_eq!(retained.pixels, pixels);
+    assert_eq!(target.progress().0, 1);
+    assert_eq!(released_at.lock().unwrap().len(), 1);
+    renderer
+        .upload_target_rgba(1, 16, 8, 0x10000, &pixels)
+        .unwrap();
+    let stamp = renderer.render_target_stamp(key).unwrap();
+    window.set_visible(false);
+    target.configure(SurfaceState {
+        width: 320,
+        height: 180,
+        visible: false,
+        vsync: true,
+        filter: ScalingFilter::Nearest,
+        sharpness: 87,
+    });
     let hidden_started = Instant::now();
+    let hidden_released_at = Arc::new(Mutex::new(Vec::new()));
     let producer = {
         let renderer = renderer.clone();
+        let hidden_released_at = hidden_released_at.clone();
         std::thread::spawn(move || {
             for n in 1..=12 {
                 assert!(renderer
@@ -153,22 +221,32 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
                             present_at: hidden_started + Duration::from_nanos(n * 16_666_667),
                             ..parameters
                         },
-                        None,
+                        Some(Box::new(ReleaseCanary(hidden_released_at.clone()))),
                     )
                     .unwrap());
             }
         })
     };
     pump_until(&mut event_loop, || {
-        producer.is_finished() && target.progress().0 >= 13
+        producer.is_finished()
+            && target.progress().0 >= 13
+            && hidden_released_at.lock().unwrap().len() == 12
     });
     producer.join().unwrap();
+    let hidden_times = hidden_released_at.lock().unwrap().clone();
+    for (index, time) in hidden_times.iter().enumerate() {
+        assert!(
+            *time >= hidden_started + Duration::from_nanos((index as u64 + 1) * 16_666_667),
+            "hidden guest buffer released before its own deadline"
+        );
+    }
     assert!(
         hidden_started.elapsed() >= Duration::from_millis(150),
         "hidden presentation advanced ahead of guest deadlines: {:?}",
         hidden_started.elapsed()
     );
     window.set_visible(true);
+    let before_visible = target.metrics().1;
     target.configure(SurfaceState {
         width: 320,
         height: 180,
@@ -177,7 +255,7 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
         filter: ScalingFilter::Nearest,
         sharpness: 87,
     });
-    pump_until(&mut event_loop, || target.metrics().1 >= 1);
+    pump_until(&mut event_loop, || target.metrics().1 > before_visible);
     for filter in [ScalingFilter::Linear, ScalingFilter::Bicubic, ScalingFilter::ScaleForce,
         ScalingFilter::Fsr, ScalingFilter::Nearest]
     {
@@ -250,7 +328,7 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
     let flipped = flipped.unwrap();
     assert_eq!(&flipped.pixels[..4], &[0, 0, 255, 255]);
     assert!(target.metrics().1 >= 25);
-    assert_eq!(target.metrics().2, 2);
+    assert_eq!(target.metrics().2, 3);
     target.configure(SurfaceState {
         width: 480,
         height: 270,
@@ -320,12 +398,16 @@ fn gpu_frames_survive_resize_snapshot_backpressure_and_shutdown() {
         });
         producer.join().unwrap();
     }
+    assert_eq!(released_at.lock().unwrap().len(), 1);
+    assert_eq!(hidden_released_at.lock().unwrap().len(), 12);
     let worker = std::thread::spawn(move || {
         target.stop();
         drop(renderer);
     });
     pump_until(&mut event_loop, || worker.is_finished());
     worker.join().unwrap();
+    assert_eq!(released_at.lock().unwrap().len(), 1);
+    assert_eq!(hidden_released_at.lock().unwrap().len(), 12);
     let errors = ERRORS.lock().unwrap();
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }

@@ -13173,7 +13173,13 @@ impl Renderer {
                         if alias.depth || alias.frozen || !color_keys.contains(&alias.key) {
                             continue;
                         }
-                        match snapshot_feedback_alias(device, cmd, rt_cache, alias.key) {
+                        match snapshot_feedback_alias(
+                            device,
+                            cmd,
+                            rt_cache,
+                            &mut frame_slots[cur_idx].retired_rt_images,
+                            alias.key,
+                        ) {
                             Ok((snap_image, snap_view, snap_format)) => {
                                 alias.image = snap_image;
                                 alias.view = snap_view;
@@ -26561,6 +26567,7 @@ fn snapshot_feedback_alias(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     rt_cache: &mut RtCache,
+    retired_rt_images: &mut Vec<GpuImage>,
     key: RtKey,
 ) -> Result<(vk::Image, vk::ImageView, vk::Format), String> {
     let (_, live_image, _, live_layout, _, _) = rt_cache
@@ -26568,7 +26575,7 @@ fn snapshot_feedback_alias(
         .ok_or_else(|| format!("feedback snapshot: no live entry {}", key.label()))?;
     let live_prev = rt_cache.color_layout(key).unwrap_or(live_layout);
     let (snap_image, snap_view, snap_format) =
-        rt_cache.get_or_create_feedback_snapshot(device, key)?;
+        rt_cache.get_or_create_feedback_snapshot(device, key, retired_rt_images)?;
     transition_image(
         device,
         cmd,
