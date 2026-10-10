@@ -115,6 +115,21 @@ impl NativeGameWindow {
         new_frames
     }
 
+    pub fn set_title(&self, title: &str) {
+        #[cfg(windows)]
+        {
+            let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                    self.hwnd as _,
+                    title.as_ptr(),
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = title;
+    }
+
     pub fn update(
         &mut self,
         rect: Option<egui::Rect>,

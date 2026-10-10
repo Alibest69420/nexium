@@ -270,6 +270,17 @@ impl Cpu {
         }
     }
 
+    pub fn backend_kind(&self) -> CpuBackendKind {
+        match self {
+            #[cfg(feature = "backend-dynarmic")]
+            Cpu::Dynarmic(_) => CpuBackendKind::Dynarmic,
+            #[cfg(feature = "backend-rustarmic")]
+            Cpu::Rustarmic(_) => CpuBackendKind::Rustarmic,
+            #[cfg(nce_runtime)]
+            Cpu::Nce(_) => CpuBackendKind::Nce,
+        }
+    }
+
     pub fn guest_cntpct(&self) -> Option<u64> {
         match self {
             #[cfg(feature = "backend-dynarmic")]

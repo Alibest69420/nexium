@@ -625,6 +625,7 @@ pub struct CpuSnapshot {
 pub struct EmuStats {
     pub svc_count: u64,
     pub cycle_count: u64,
+    pub cpu_backend: Option<nexium_cpu::CpuBackendKind>,
 }
 
 pub type RepaintHook = Arc<dyn Fn() + Send + Sync>;
@@ -821,6 +822,7 @@ impl EmulationHandle {
 
             let mut chained_argv: Option<String> = None;
             'launcher: loop {
+                stats_clone.lock().cpu_backend = None;
                 log::info!("Booting NRO: {}", cur_nro_path);
 
                 if let Some(stem) = Path::new(&cur_nro_path)
@@ -869,6 +871,10 @@ impl EmulationHandle {
                     .cpu
                     .take()
                     .expect("BootContext CPU not initialized");
+                stats_clone.lock().cpu_backend = Some(cpu.backend_kind());
+                if let Some(hook) = &repaint {
+                    hook();
+                }
                 let strict_null_memory =
                     matches!(cpu_backend, nexium_core::cpu::CpuBackendKind::Rustarmic)
                         || std::env::var_os("NEXIUM_STRICT_NULL").is_some();
@@ -2500,6 +2506,10 @@ impl EmulationHandle {
 
     pub fn snapshot(&self) -> CpuSnapshot {
         self.cpu_snapshot.lock().clone()
+    }
+
+    pub fn active_cpu_backend(&self) -> Option<nexium_cpu::CpuBackendKind> {
+        self.stats.lock().cpu_backend
     }
 
     pub fn stop(&mut self) {

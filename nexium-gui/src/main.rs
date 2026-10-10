@@ -16,6 +16,7 @@ mod debugger;
 mod depth_emit;
 mod firmware_prompt;
 mod frame_scaler;
+mod game_title;
 mod hd_rumble;
 mod homebrew;
 mod input;

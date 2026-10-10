@@ -776,6 +776,7 @@ fn diagnostics_enabled() -> bool {
 pub struct HorizonApp {
     nro_path: String,
     emulation_handle: Option<EmulationHandle>,
+    title_cpu_backend: Option<nexium_cpu::CpuBackendKind>,
     game_texture: Option<egui::TextureHandle>,
     egui_ctx: egui::Context,
     wgpu_state: Option<eframe::egui_wgpu::RenderState>,
@@ -1427,6 +1428,7 @@ impl HorizonApp {
         let mut app = Self {
             nro_path: nro_path.clone(),
             emulation_handle: None,
+            title_cpu_backend: None,
             game_texture: None,
             egui_ctx: cc.egui_ctx.clone(),
             wgpu_state: cc.wgpu_render_state.clone(),
@@ -1610,9 +1612,8 @@ impl HorizonApp {
                     game_index,
                     start_time: 0.0,
                 };
-                cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-                    app.game_window_title(&launched),
-                ));
+                let title = app.game_window_title(&launched);
+                app.set_game_window_title(&cc.egui_ctx, title);
                 app.playing_path = Some(launched);
                 log::info!("Auto-loaded NRO: {} (CPU: {})", nro_path, backend.label());
             } else {
@@ -2143,6 +2144,7 @@ impl HorizonApp {
     }
 
     fn poll_frames(&mut self, ctx: &egui::Context) {
+        self.refresh_cpu_backend_title(ctx);
         let mut observed_native_frame = false;
         if let Some(window) = &mut self.native_game {
             let new_frames = window.poll();
@@ -8408,9 +8410,8 @@ impl HorizonApp {
                     {
                         nexium_common::speed_limit::toggle();
                         if let Some(path) = &self.playing_path {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-                                self.game_window_title(path),
-                            ));
+                            let title = self.game_window_title(path);
+                            self.set_game_window_title(ctx, title);
                         }
                     }
 
@@ -8538,7 +8539,28 @@ impl HorizonApp {
             .map_or_else(|| "Unknown".into(), |state| state.adapter.get_info().name)
     }
 
-    fn game_window_title(&self, path: &std::path::Path) -> String {
+    fn set_game_window_title(&mut self, ctx: &egui::Context, title: crate::game_title::GameWindowTitle) {
+        self.title_cpu_backend = title.cpu_backend;
+        if let Some(window) = &self.native_game {
+            window.set_title(&title.text);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.text));
+    }
+
+    fn refresh_cpu_backend_title(&mut self, ctx: &egui::Context) {
+        let Some(handle) = &self.emulation_handle else {
+            self.title_cpu_backend = None;
+            return;
+        };
+        if handle.active_cpu_backend() != self.title_cpu_backend {
+            if let Some(path) = &self.playing_path {
+                let title = self.game_window_title(path);
+                self.set_game_window_title(ctx, title);
+            }
+        }
+    }
+
+    fn game_window_title(&self, path: &std::path::Path) -> crate::game_title::GameWindowTitle {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -8585,7 +8607,10 @@ impl HorizonApp {
         if !nexium_common::speed_limit::enabled() {
             title.push_str(" | Unlocked");
         }
-        title
+        crate::game_title::with_active_cpu_backend(
+            title,
+            self.emulation_handle.as_ref().and_then(EmulationHandle::active_cpu_backend),
+        )
     }
 
     fn boot_nro(&mut self, ctx: &egui::Context) {
@@ -8623,7 +8648,8 @@ impl HorizonApp {
                     self.carousel.selected = n + crate::carousel::CS_FRONT;
                     self.carousel.scroll_offset = (n + crate::carousel::CS_FRONT) as f32;
                 }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.game_window_title(&path)));
+                let title = self.game_window_title(&path);
+                self.set_game_window_title(ctx, title);
                 self.playing_path = Some(path);
             }
             Err(e) => log::error!("Boot: {}", e),
@@ -8633,6 +8659,10 @@ impl HorizonApp {
     fn stop_emulation(&mut self) {
         self.egui_ctx
             .send_viewport_cmd(egui::ViewportCommand::Title("NeXium".to_string()));
+        self.title_cpu_backend = None;
+        if let Some(window) = &self.native_game {
+            window.set_title("NeXium");
+        }
         self.play_times.save_if_dirty();
         self.carousel.boot_stage = crate::carousel::BootStage::None;
         let was_paused = self
@@ -10323,7 +10353,8 @@ impl eframe::App for HorizonApp {
             let limited = nexium_common::speed_limit::toggle();
             log::info!("Emulation speed: {}", if limited { "limited" } else { "unlocked" });
             if let Some(path) = &self.playing_path {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.game_window_title(path)));
+                let title = self.game_window_title(path);
+                self.set_game_window_title(ctx, title);
             }
             ctx.request_repaint();
         }
