@@ -5078,6 +5078,145 @@ fn guest_clock_ns_at(at: std::time::Instant) -> u64 {
     now_ns.saturating_sub(age) as u64
 }
 
+fn timing_forensics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEXIUM_TIMING_FORENSICS").is_ok_and(|value| value == "1")
+    })
+}
+
+fn take_timing_forensics_sample(
+    enabled: bool,
+    counter: &std::sync::atomic::AtomicU32,
+    limit: u32,
+) -> Option<u32> {
+    use std::sync::atomic::Ordering;
+    if !enabled {
+        return None;
+    }
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < limit).then(|| count + 1)
+        })
+        .ok()
+        .map(|count| count + 1)
+}
+
+fn timing_forensics_delay_ready(
+    elapsed: std::time::Duration,
+    delay: std::time::Duration,
+) -> bool {
+    elapsed >= delay
+}
+
+fn reserve_timing_forensics_sample(
+    counter: &std::sync::atomic::AtomicU32,
+    limit: u32,
+) -> Option<u32> {
+    use std::sync::atomic::Ordering;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    if counter.load(Ordering::Relaxed) >= limit || !timing_forensics_enabled() {
+        return None;
+    }
+    static DELAY: OnceLock<Duration> = OnceLock::new();
+    let delay = *DELAY.get_or_init(|| {
+        Duration::from_secs(
+            std::env::var("NEXIUM_TIMING_FORENSICS_AFTER_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0),
+        )
+    });
+    if !delay.is_zero() {
+        static START: OnceLock<Instant> = OnceLock::new();
+        let elapsed = START.get_or_init(Instant::now).elapsed();
+        if !timing_forensics_delay_ready(elapsed, delay) {
+            return None;
+        }
+    }
+    take_timing_forensics_sample(true, counter, limit)
+}
+
+fn timing_forensics_snapshot() -> (u64, u64, u64) {
+    let ticks = current_guest_ticks();
+    let (pc, lr) = cpu_ref()
+        .map(|cpu| (cpu.get_pc(), cpu.get_register(30)))
+        .unwrap_or((0, 0));
+    (ticks, pc, lr)
+}
+
+#[cfg(test)]
+mod timing_forensics_tests {
+    use super::{take_timing_forensics_sample, timing_forensics_delay_ready};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn delay_opens_exactly_at_the_requested_boundary() {
+        let delay = Duration::from_secs(120);
+        assert!(!timing_forensics_delay_ready(
+            delay - Duration::from_nanos(1),
+            delay
+        ));
+        assert!(timing_forensics_delay_ready(delay, delay));
+        assert!(timing_forensics_delay_ready(
+            delay + Duration::from_nanos(1),
+            delay
+        ));
+        assert!(timing_forensics_delay_ready(Duration::ZERO, Duration::ZERO));
+    }
+
+    #[test]
+    fn disabled_gate_does_not_consume_samples() {
+        let counter = AtomicU32::new(0);
+        assert_eq!(take_timing_forensics_sample(false, &counter, 16), None);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        assert_eq!(take_timing_forensics_sample(true, &counter, 16), Some(1));
+    }
+
+    #[test]
+    fn independent_limits_stop_without_counter_wraparound() {
+        for limit in [0, 8, 16] {
+            let counter = AtomicU32::new(0);
+            for call in 1..=4_096 {
+                assert_eq!(
+                    take_timing_forensics_sample(true, &counter, limit),
+                    (call <= limit).then_some(call)
+                );
+            }
+            assert_eq!(counter.load(Ordering::Relaxed), limit);
+        }
+        let counter = AtomicU32::new(u32::MAX);
+        assert_eq!(take_timing_forensics_sample(true, &counter, u32::MAX), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u32::MAX);
+    }
+
+    #[test]
+    fn concurrent_reservations_remain_bounded_and_unique() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let counter = Arc::clone(&counter);
+                std::thread::spawn(move || {
+                    (0..64)
+                        .filter_map(|_| take_timing_forensics_sample(true, &counter, 16))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut samples: Vec<_> = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect();
+        samples.sort_unstable();
+        assert_eq!(samples, (1..=16).collect::<Vec<_>>());
+        assert_eq!(counter.load(Ordering::Relaxed), 16);
+    }
+}
+
 fn svc_get_system_tick(_kernel: &mut Kernel) -> u32 {
     let ticks = current_guest_ticks();
     if let Some(cpu) = cpu_mut() {
@@ -6446,6 +6585,10 @@ fn dispatch_service_v2(
             return build_ipc_response(ctx, 0x480, &[], &[]);
         }
     }
+
+    if let Some(response) = crate::services::am::dispatch_account_load_open_context(
+        kernel, ctx, session_handle, port_name, cmd_id,
+    ) { return response; }
 
     if let Some(sub_service) = crate::services::am::proxy_subsession(port_name, cmd_id) {
         log::debug!(
@@ -9272,6 +9415,184 @@ const IGBP_ALLOCATE_BUFFERS: u32 = 13;
 const IGBP_SET_PREALLOCATED_BUFFER: u32 = 14;
 const IGBP_GET_BUFFER_HISTORY: u32 = 17;
 
+const BQ_WAIT_PROFILE_MAX_SAMPLES: u32 = 16;
+static BQ_WAIT_PROFILE_SAMPLES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+fn bq_wait_profile_flag(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn bq_wait_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        bq_wait_profile_flag(std::env::var("NEXIUM_BQ_WAIT_PROFILE").ok().as_deref())
+    })
+}
+
+fn bq_wait_profile_delay(value: Option<&str>) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        value
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(600_000),
+    )
+}
+
+fn bq_wait_profile_delay_ready(
+    elapsed: std::time::Duration,
+    delay: std::time::Duration,
+) -> bool {
+    elapsed >= delay
+}
+
+fn bq_wait_profile_tracking_enabled() -> bool {
+    if !bq_wait_profile_enabled()
+        || BQ_WAIT_PROFILE_SAMPLES.load(std::sync::atomic::Ordering::Relaxed)
+            >= BQ_WAIT_PROFILE_MAX_SAMPLES
+    {
+        return false;
+    }
+    static START: std::sync::OnceLock<(std::time::Instant, std::time::Duration)> =
+        std::sync::OnceLock::new();
+    let (started, delay) = START.get_or_init(|| {
+        (
+            std::time::Instant::now(),
+            bq_wait_profile_delay(
+                std::env::var("NEXIUM_BQ_WAIT_PROFILE_AFTER_MS").ok().as_deref(),
+            ),
+        )
+    });
+    delay.is_zero() || bq_wait_profile_delay_ready(started.elapsed(), *delay)
+}
+
+fn reserve_bq_wait_profile_sample(
+    enabled: bool,
+    failed_polls: u64,
+    counter: &std::sync::atomic::AtomicU32,
+) -> Option<u32> {
+    take_timing_forensics_sample(
+        enabled && failed_polls != 0,
+        counter,
+        BQ_WAIT_PROFILE_MAX_SAMPLES,
+    )
+}
+
+struct BufferQueueWaitProfile {
+    first_counts: [usize; 4],
+    thread: u32,
+    pc: u64,
+    lr: u64,
+    failed_polls: u64,
+}
+
+#[cfg(test)]
+mod bq_wait_profile_tests {
+    use super::{
+        bq_wait_profile_delay, bq_wait_profile_delay_ready, bq_wait_profile_flag,
+        reserve_bq_wait_profile_sample,
+    };
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn wait_profile_requires_exact_one() {
+        for value in [None, Some(""), Some("0"), Some("true"), Some(" 1"), Some("1 ")] {
+            assert!(!bq_wait_profile_flag(value));
+        }
+        assert!(bq_wait_profile_flag(Some("1")));
+    }
+
+    #[test]
+    fn delay_defaults_invalid_values_to_zero_and_clamps_at_ten_minutes() {
+        for value in [
+            None,
+            Some(""),
+            Some("invalid"),
+            Some("-1"),
+            Some("18446744073709551616"),
+        ] {
+            assert_eq!(bq_wait_profile_delay(value), Duration::ZERO);
+        }
+        assert_eq!(
+            bq_wait_profile_delay(Some("180000")),
+            Duration::from_millis(180_000),
+        );
+        assert_eq!(
+            bq_wait_profile_delay(Some("600000")),
+            Duration::from_millis(600_000),
+        );
+        assert_eq!(
+            bq_wait_profile_delay(Some("600001")),
+            Duration::from_millis(600_000),
+        );
+        assert_eq!(
+            bq_wait_profile_delay(Some("18446744073709551615")),
+            Duration::from_millis(600_000),
+        );
+    }
+
+    #[test]
+    fn delay_boundary_is_inclusive() {
+        let delay = Duration::from_millis(180_000);
+        assert!(!bq_wait_profile_delay_ready(
+            delay - Duration::from_nanos(1),
+            delay,
+        ));
+        assert!(bq_wait_profile_delay_ready(delay, delay));
+        assert!(bq_wait_profile_delay_ready(
+            delay + Duration::from_nanos(1),
+            delay,
+        ));
+        assert!(bq_wait_profile_delay_ready(Duration::ZERO, Duration::ZERO));
+    }
+
+    #[test]
+    fn disabled_or_nonwaiting_calls_do_not_consume_samples() {
+        let counter = AtomicU32::new(0);
+        assert_eq!(reserve_bq_wait_profile_sample(false, 5, &counter), None);
+        assert_eq!(reserve_bq_wait_profile_sample(true, 0, &counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn completed_wait_samples_stop_at_sixteen_without_overflow() {
+        let counter = AtomicU32::new(0);
+        for sample in 1..=16 {
+            assert_eq!(reserve_bq_wait_profile_sample(true, 1, &counter), Some(sample));
+        }
+        for _ in 0..32 {
+            assert_eq!(reserve_bq_wait_profile_sample(true, 1, &counter), None);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 16);
+        counter.store(u32::MAX, Ordering::Relaxed);
+        assert_eq!(reserve_bq_wait_profile_sample(true, 1, &counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u32::MAX);
+    }
+
+    #[test]
+    fn concurrent_completed_waits_share_one_bounded_budget() {
+        let counter = std::sync::Arc::new(AtomicU32::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    (0..32)
+                        .filter_map(|_| reserve_bq_wait_profile_sample(true, 1, &counter))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut samples: Vec<_> = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect();
+        samples.sort_unstable();
+        assert_eq!(samples, (1..=16).collect::<Vec<_>>());
+        assert_eq!(counter.load(Ordering::Relaxed), 16);
+    }
+}
+
 fn handle_binder_transact(
     kernel: &mut Kernel,
     ctx: &mut ipc::IpcCtx,
@@ -9507,6 +9828,8 @@ fn igbp_handle_transact(
             let _fmt = reader.read_i32();
             let _usage = reader.read_u32();
             let started = std::time::Instant::now();
+            let profile_waits = bq_wait_profile_tracking_enabled() && !async_dequeue;
+            let mut wait_profile: Option<BufferQueueWaitProfile> = None;
             let (slot, free, deq, queued) = loop {
                 let state = kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
                     (
@@ -9514,17 +9837,33 @@ fn igbp_handle_transact(
                         bq.free.len(),
                         bq.dequeued.len(),
                         bq.queued.len(),
+                        profile_waits.then(|| bq.acquired.len()),
                     )
                 });
-                if let (Some(slot), free, deq, queued) = state {
+                if let (Some(slot), free, deq, queued, _) = state {
                     break (Some(slot), free, deq, queued);
                 }
                 if async_dequeue {
-                    let (_, free, deq, queued) = state;
+                    let (_, free, deq, queued, _) = state;
                     break (None, free, deq, queued);
                 }
+                if profile_waits {
+                    let sample = wait_profile.get_or_insert_with(|| {
+                        let (pc, lr) = cpu_ref()
+                            .map(|cpu| (cpu.get_pc(), cpu.get_register(30)))
+                            .unwrap_or((0, 0));
+                        BufferQueueWaitProfile {
+                            first_counts: [state.1, state.2, state.3, state.4.unwrap_or(0)],
+                            thread: kernel.threads.current_handle().unwrap_or(0),
+                            pc,
+                            lr,
+                            failed_polls: 0,
+                        }
+                    });
+                    sample.failed_polls = sample.failed_polls.saturating_add(1);
+                }
                 if started.elapsed() >= std::time::Duration::from_secs(3) {
-                    let (_, free, deq, queued) = state;
+                    let (_, free, deq, queued, _) = state;
                     log::error!(
                         "IGBP::DequeueBuffer timed out waiting for a released slot binder={} (free={} deq={} queued={})",
                         binder_id,
@@ -9536,6 +9875,33 @@ fn igbp_handle_transact(
                 }
                 std::thread::sleep(std::time::Duration::from_micros(100));
             };
+            if let Some(wait) = wait_profile {
+                if let Some(sample) = reserve_bq_wait_profile_sample(
+                    profile_waits,
+                    wait.failed_polls,
+                    &BQ_WAIT_PROFILE_SAMPLES,
+                ) {
+                    log::warn!(
+                        "[bq-wait] sample={} binder={} thread={:#x} pc={:#x} lr={:#x} first_free={} first_dequeued={} first_queued={} first_acquired={} waited_ms={:.3} failed_polls={} outcome={} slot={:?} final_free={} final_dequeued={} final_queued={}",
+                        sample,
+                        binder_id,
+                        wait.thread,
+                        wait.pc,
+                        wait.lr,
+                        wait.first_counts[0],
+                        wait.first_counts[1],
+                        wait.first_counts[2],
+                        wait.first_counts[3],
+                        started.elapsed().as_secs_f64() * 1000.0,
+                        wait.failed_polls,
+                        if slot.is_some() { "success" } else { "timeout" },
+                        slot,
+                        free,
+                        deq,
+                        queued,
+                    );
+                }
+            }
             if nexium_nvdrv::kick_timeline_enabled() {
                 log::warn!(
                     "[ktl] us={} dequeue slot={:?} waited_ms={:.1}",
@@ -9572,8 +9938,8 @@ fn igbp_handle_transact(
             let slot = reader.read_i32().unwrap_or(0).max(0) as u32;
             let flattened_size = reader.read_u32().unwrap_or(0);
             let flattened_size_hi = reader.read_u32().unwrap_or(0);
-            let _timestamp = reader.read_u64();
-            let _is_auto = reader.read_i32();
+            let guest_timestamp = reader.read_u64();
+            let is_auto_timestamp = reader.read_i32();
             let crop_l = reader.read_i32().unwrap_or(0);
             let crop_t = reader.read_i32().unwrap_or(0);
             let crop_r = reader.read_i32().unwrap_or(0);
@@ -9693,6 +10059,23 @@ fn igbp_handle_transact(
                     swap_interval,
                     prev_interval
                 );
+                static TIMING_CHANGES: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if let Some(sample) = reserve_timing_forensics_sample(&TIMING_CHANGES, 16) {
+                    let (ticks, pc, lr) = timing_forensics_snapshot();
+                    log::warn!(
+                        "[timing-interval] sample={} binder={} old={:?} new={} timestamp_ns={:?} auto={:?} tick={} pc={:#x} lr={:#x}",
+                        sample,
+                        binder_id,
+                        prev_interval,
+                        swap_interval,
+                        guest_timestamp.map(|value| value as i64),
+                        is_auto_timestamp,
+                        ticks,
+                        pc,
+                        lr
+                    );
+                }
             }
             let gb_opt = kernel.nvdrv.with_bufferqueue(binder_id, |bq| {
                 let slot_acquired = bq.queue_and_acquire(slot);
@@ -11084,6 +11467,11 @@ fn igbp_handle_transact(
         }
         IGBP_GET_BUFFER_HISTORY => {
             let requested = reader.read_i32().unwrap_or(0);
+            static TIMING_HISTORY: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let timing_sample = reserve_timing_forensics_sample(&TIMING_HISTORY, 8);
+            let mut returned = 0;
+            let mut timing_first = None;
             let mut p = ParcelBuilder::new();
             if requested <= 0 {
                 p.write_u32((-22i32) as u32);
@@ -11093,21 +11481,44 @@ fn igbp_handle_transact(
                     .nvdrv
                     .with_bufferqueue(binder_id, |bq| bq.history(requested as usize));
                 let guest_ns = guest_clock_ns_at;
+                returned = entries.len();
                 p.write_u32(0);
                 p.write_u32(entries.len() as u32);
                 for entry in &entries {
                     let presented = entry.presented_at.map_or(0, guest_ns);
-                    for value in [entry.frame_number, guest_ns(entry.queued_at), presented] {
+                    let queued = guest_ns(entry.queued_at);
+                    for value in [entry.frame_number, queued, presented] {
                         p.write_u32(value as u32);
                         p.write_u32((value >> 32) as u32);
                     }
-                    p.write_u32(match entry.state {
+                    let state = match entry.state {
                         nexium_nvdrv::bufferqueue::SlotState::Free => 0,
                         nexium_nvdrv::bufferqueue::SlotState::Dequeued => 1,
                         nexium_nvdrv::bufferqueue::SlotState::Queued => 2,
                         nexium_nvdrv::bufferqueue::SlotState::Acquired => 3,
-                    });
+                    };
+                    p.write_u32(state);
+                    if timing_sample.is_some() && timing_first.is_none() {
+                        timing_first = Some((entry.frame_number, queued, presented, state));
+                    }
                 }
+            }
+            if let Some(sample) = timing_sample {
+                let (ticks, pc, lr) = timing_forensics_snapshot();
+                log::warn!(
+                    "[timing-history] sample={} binder={} requested={} returned={} first_frame={:?} first_queue_ns={:?} first_present_ns={:?} first_state={:?} tick={} pc={:#x} lr={:#x}",
+                    sample,
+                    binder_id,
+                    requested,
+                    returned,
+                    timing_first.map(|entry| entry.0),
+                    timing_first.map(|entry| entry.1),
+                    timing_first.map(|entry| entry.2),
+                    timing_first.map(|entry| entry.3),
+                    ticks,
+                    pc,
+                    lr
+                );
             }
             p.finish()
         }
@@ -12716,7 +13127,7 @@ fn applet_buffer_response(port_name: &str, cmd_id: u32) -> Option<Vec<u8>> {
         ("IHOSBinderDriver", 0) | ("IHOSBinderDriver", 3) => Some(build_igbp_success_parcel()),
         ("ILaunchParamStorageAccessor", 11) => Some(build_launch_parameter()),
         ("IStorageAccessorOut", 11) => Some(crate::services::am::applet_out_data()),
-        ("acc:u0" | "acc:u1" | "acc:aa", 2 | 3 | 141) => Some(build_user_id_list()),
+        ("acc:u0" | "acc:u1" | "acc:aa", 2 | 3 | 60 | 131 | 141) => Some(build_user_id_list()),
         ("IProfile", 0) => Some(vec![0u8; 0x80]),
         _ => None,
     }
@@ -12931,10 +13342,298 @@ fn build_launch_parameter() -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
+mod account_load_open_context_tests {
+    use super::{close_domain_object, dispatch_service_v2, service_for_domain_object,
+        HandleType, Kernel, Session};
+    use crate::services::am;
+    use nexium_ipc::{IpcCtx, CMIF_IN_MAGIC};
+    use nexium_memory::{AddressSpace, Perm};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    const TOKEN: u32 = 0x1234_5678;
+    const NULL_ARGUMENT: u32 = 124 | (20 << 9);
+    const INVALID_ARGUMENT: u32 = 124 | (22 << 9);
+
+    fn request(command: u32, input: &[u8], domain: bool) -> IpcCtx {
+        let mut bytes = vec![0; 0x100];
+        bytes[..4].copy_from_slice(&4u32.to_le_bytes());
+        let prefix = if domain { 16 } else { 0 };
+        let words = (prefix + 16 + input.len()).div_ceil(4);
+        bytes[4..8].copy_from_slice(&(words as u32).to_le_bytes());
+        if domain {
+            bytes[0x10] = 1;
+            bytes[0x12..0x14].copy_from_slice(&((16 + input.len()) as u16).to_le_bytes());
+            bytes[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let cmif = 0x10 + prefix;
+        bytes[cmif..cmif + 4].copy_from_slice(&CMIF_IN_MAGIC.to_le_bytes());
+        bytes[cmif + 8..cmif + 12].copy_from_slice(&command.to_le_bytes());
+        bytes[cmif + 12..cmif + 16].copy_from_slice(&TOKEN.to_le_bytes());
+        bytes[cmif + 16..cmif + 16 + input.len()].copy_from_slice(input);
+        let mut ctx = IpcCtx::parse(bytes, domain).unwrap();
+        ctx.cmif_in_data_len = input.len();
+        ctx
+    }
+
+    fn fixture(domain: bool, port: &str) -> (Kernel, u32) {
+        static NEXT_SPACE: AtomicU64 = AtomicU64::new(0);
+        let base = 0x1000_0000_0000 + NEXT_SPACE.fetch_add(1, Ordering::Relaxed) * 0x10_0000;
+        let memory = Arc::new(AddressSpace::new());
+        memory.map(base, 0x20000, Perm::RW, "account_load_context_test").unwrap();
+        let mut kernel = Kernel::new(memory, base, 0x1000, base + 0x10000, 0x1000,
+            base + 0x18000, 0x1000, base + 0x19000, base + 0x1a000);
+        let handle = kernel.handles.create_handle(HandleType::Session);
+        let mut session = Session::new(handle, port.to_string());
+        if domain { session.convert_to_domain(); }
+        kernel.sessions.insert(handle, session);
+        (kernel, handle)
+    }
+
+    fn word(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn assert_result(response: &[u8], domain: bool, expected: u32) {
+        let cmif = if domain { 0x20 } else { 0x10 };
+        assert_eq!(&response[cmif..cmif + 4], b"SFCO");
+        assert_eq!(word(response, cmif + 8), expected);
+        assert_eq!(word(response, cmif + 12), TOKEN);
+    }
+
+    fn assert_no_object(response: &[u8], domain: bool) {
+        let hipc = u64::from_le_bytes(response[..8].try_into().unwrap());
+        assert_eq!(hipc >> 63, 0, "no copy/move handles on this reply");
+        assert_eq!(response.len(), if domain { 0x30 } else { 0x20 }, "no fabricated inline output");
+        if domain { assert_eq!(word(response, 0x10), 0); }
+    }
+
+    fn dispatch(kernel: &mut Kernel, port: &str, ctx: &mut IpcCtx, handle: u32) -> Vec<u8> {
+        dispatch_service_v2(kernel, port, ctx, handle, &mut Vec::new())
+    }
+
+    #[test]
+    fn selected_user_returns_a_real_moved_manager_session_and_independent_lifetime() {
+        let (mut kernel, parent) = fixture(false, "acc:u0");
+        let mut high_half_user = [0; 16];
+        high_half_user[8] = 1;
+        for uid in [am::ACCOUNT_UID, high_half_user] {
+            let sessions = kernel.sessions.len();
+            let mut ctx = request(130, &uid, false);
+            let original = ctx.buf.clone();
+            let response = dispatch(&mut kernel, "acc:u0", &mut ctx, parent);
+            assert_result(&response, false, 0);
+            assert_eq!(response.len(), 0x20, "only transport handle plus CMIF header");
+            assert_eq!((word(&response, 8) >> 1) & 15, 0, "no copy handle");
+            assert_eq!((word(&response, 8) >> 5) & 15, 1, "one moved handle");
+            let manager = word(&response, 12);
+            assert_ne!(manager, parent);
+            assert_eq!(kernel.handles.get_handle(manager).unwrap().handle_type, HandleType::Session);
+            assert_eq!(kernel.sessions[&manager].port_name, "IManagerForApplication");
+            assert_eq!(kernel.sessions.len(), sessions + 1);
+            assert_eq!(ctx.buf, original, "request/UID bytes unchanged");
+            let response = dispatch(&mut kernel, "IManagerForApplication", &mut request(0, &[], false), manager);
+            assert_result(&response, false, 0, );
+            kernel.handles.close_handle(manager).unwrap();
+            kernel.sessions.remove(&manager).unwrap();
+            assert_eq!(kernel.sessions.len(), sessions);
+            assert!(kernel.sessions.contains_key(&parent));
+            assert!(kernel.handles.get_handle(parent).is_some());
+            assert!(kernel.handles.get_handle(manager).is_none());
+        }
+    }
+
+    #[test]
+    fn domain_manager_is_shared_with_clones_and_closes_without_destroying_account() {
+        let (mut kernel, parent) = fixture(true, "acc:u0");
+        let sibling = kernel.handles.create_handle(HandleType::Session);
+        let mut clone = kernel.sessions[&parent].clone();
+        clone.handle = sibling;
+        kernel.sessions.insert(sibling, clone);
+        let session_count = kernel.sessions.len();
+        let response = dispatch(&mut kernel, "acc:u0", &mut request(130, &am::ACCOUNT_UID, true), parent);
+        assert_result(&response, true, 0);
+        assert_eq!(response.len(), 0x34, "one domain object ID, no inline payload");
+        assert_eq!(word(&response, 0x10), 1);
+        assert_eq!(u64::from_le_bytes(response[..8].try_into().unwrap()) >> 63, 0);
+        let object = word(&response, 0x30);
+        assert_eq!(object, 2);
+        assert_eq!(kernel.sessions.len(), session_count, "domain object is not a new session");
+        for handle in [parent, sibling] {
+            assert_eq!(service_for_domain_object(&kernel, handle, object).as_deref(), Some("IManagerForApplication"));
+            let mut ctx = request(0, &[], true);
+            ctx.domain.as_mut().unwrap().object_id = object;
+            let response = dispatch(&mut kernel, "IManagerForApplication", &mut ctx, handle);
+            assert_result(&response, true, 0);
+        }
+        let mut closed = close_domain_object(&mut kernel, parent, object);
+        closed.sort_unstable();
+        let mut expected = vec![parent, sibling];
+        expected.sort_unstable();
+        assert_eq!(closed, expected);
+        for handle in [parent, sibling] {
+            assert!(service_for_domain_object(&kernel, handle, object).is_none());
+            assert_eq!(service_for_domain_object(&kernel, handle, 1).as_deref(), Some("acc:u0"));
+        }
+        let response = dispatch(&mut kernel, "acc:u0", &mut request(130, &am::ACCOUNT_UID, true), sibling);
+        assert_eq!(word(&response, 0x30), object + 1);
+        assert_eq!(kernel.handles.create_handle(HandleType::Session), sibling + 1, "domain replies did not allocate hidden handles");
+    }
+
+    #[test]
+    fn zero_uid_returns_exact_account_null_argument_without_allocating_objects() {
+        for domain in [false, true] {
+            let (mut kernel, parent) = fixture(domain, "acc:u0");
+            let session_count = kernel.sessions.len();
+            let original_objects = kernel.sessions[&parent].domain_objects.clone();
+            let response = dispatch(&mut kernel, "acc:u0", &mut request(130, &[0; 16], domain), parent);
+            assert_result(&response, domain, NULL_ARGUMENT);
+            assert_no_object(&response, domain);
+            assert_eq!(kernel.sessions.len(), session_count);
+            assert_eq!(kernel.sessions[&parent].domain_objects, original_objects);
+            assert_eq!(kernel.handles.create_handle(HandleType::Session), parent + 1);
+        }
+    }
+
+    #[test]
+    fn truncated_and_invalid_uid_spans_are_bounded_and_do_not_allocate_objects() {
+        for domain in [false, true] {
+            for length in [0usize, 1, 8, 15, 16, 17] {
+                let (mut kernel, parent) = fixture(domain, "acc:u0");
+                let mut ctx = request(130, &vec![1; length.min(15)], domain);
+                if length == 16 {
+                    ctx.cmif_in_data_len = 16;
+                    ctx.cmif_in_data_off = usize::MAX - 7;
+                } else if length == 17 {
+                    ctx.cmif_in_data_len = 16;
+                    ctx.cmif_in_data_off = ctx.buf.len() - 8;
+                }
+                let before = ctx.buf.clone();
+                let session_count = kernel.sessions.len();
+                let original_objects = kernel.sessions[&parent].domain_objects.clone();
+                let response = dispatch(&mut kernel, "acc:u0", &mut ctx, parent);
+                assert_result(&response, domain, INVALID_ARGUMENT);
+                assert_no_object(&response, domain);
+                assert_eq!(ctx.buf, before);
+                assert_eq!(kernel.sessions.len(), session_count);
+                assert_eq!(kernel.sessions[&parent].domain_objects, original_objects);
+                assert_eq!(kernel.handles.create_handle(HandleType::Session), parent + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn command130_on_other_account_interfaces_keeps_its_existing_routing() {
+        for port in ["acc:u1", "acc:aa", "acc:su"] {
+            for domain in [false, true] {
+                let (mut kernel, parent) = fixture(domain, port);
+                let mut ctx = request(130, &am::ACCOUNT_UID, domain);
+                assert!(am::dispatch_account_load_open_context(&mut kernel, &mut ctx, parent, port, 130).is_none());
+                assert!(am::proxy_subsession(port, 130).is_none());
+                let session_count = kernel.sessions.len();
+                let original_objects = kernel.sessions[&parent].domain_objects.clone();
+                let response = dispatch(&mut kernel, port, &mut ctx, parent);
+                assert_result(&response, domain, 0);
+                assert_no_object(&response, domain);
+                assert_eq!(kernel.sessions.len(), session_count);
+                assert_eq!(kernel.sessions[&parent].domain_objects, original_objects);
+                assert_eq!(kernel.handles.create_handle(HandleType::Session), parent + 1);
+            }
+        }
+        let (mut kernel, parent) = fixture(false, "acc:u0");
+        let mut ctx = request(101, &am::ACCOUNT_UID, false);
+        assert!(am::dispatch_account_load_open_context(&mut kernel, &mut ctx, parent, "acc:u0", 101).is_none());
+        assert_eq!(am::proxy_subsession("acc:u0", 101), Some("IManagerForApplication"));
+    }
+}
+
 fn build_user_id_list() -> Vec<u8> {
     let mut out = vec![0u8; 0x80];
     out[0..16].copy_from_slice(&crate::services::am::ACCOUNT_UID);
     out
+}
+
+#[cfg(test)]
+mod account_open_context_tests {
+    use super::{build_launch_parameter, dispatch_service_v2, Kernel};
+    use crate::services::am::ACCOUNT_UID;
+    use nexium_ipc::{IpcBuffer, IpcCtx, CMIF_IN_MAGIC};
+    use nexium_memory::{AddressSpace, Perm};
+    use std::sync::Arc;
+
+    fn request(command: u32) -> IpcCtx {
+        let mut bytes = vec![0; 0x100];
+        bytes[..4].copy_from_slice(&4u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&CMIF_IN_MAGIC.to_le_bytes());
+        bytes[0x18..0x1c].copy_from_slice(&command.to_le_bytes());
+        IpcCtx::parse(bytes, false).unwrap()
+    }
+
+    fn kernel(memory: Arc<AddressSpace>, base: u64) -> Kernel {
+        Kernel::new(memory, base, 0x1000, base + 0x10000, 0x1000,
+            base + 0x18000, 0x1000, base + 0x19000, base + 0x1a000)
+    }
+
+    #[test]
+    fn stored_open_context_returns_only_the_launch_selected_user() {
+        const BASE: u64 = 0x1000_0000_0000;
+        let memory = Arc::new(AddressSpace::new());
+        memory.map(BASE, 0x20000, Perm::RW, "account_context_test").unwrap();
+        let mut kernel = kernel(Arc::clone(&memory), BASE);
+        assert_eq!(&build_launch_parameter()[8..24], &ACCOUNT_UID);
+        for command in [3, 60, 131] {
+            for static_buffer in [false, true] {
+                memory.write(BASE, &[0xa5; 0x90]).unwrap();
+                let mut ctx = request(command);
+                let output = IpcBuffer { addr: BASE + 8, size: 0x80, mode: 0 };
+                if static_buffer { ctx.recv_statics.push(output); }
+                else { ctx.recv_buffers.push(output); }
+                let response = dispatch_service_v2(
+                    &mut kernel, "acc:u0", &mut ctx, 0x80, &mut Vec::new());
+                assert_eq!(&response[0x18..0x1c], &0u32.to_le_bytes());
+                assert_eq!(response.len(), 0x20, "user lists have no inline count");
+                let mut actual = [0; 0x90];
+                memory.read(BASE, &mut actual).unwrap();
+                assert_eq!(&actual[..8], &[0xa5; 8]);
+                assert_eq!(&actual[0x88..], &[0xa5; 8]);
+                let users = &actual[8..0x88];
+                assert_eq!(&users[..16], &ACCOUNT_UID);
+                assert!(users[16..].iter().all(|byte| *byte == 0));
+                assert_eq!(users.chunks_exact(16)
+                    .filter(|uid| uid.iter().any(|byte| *byte != 0)).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn stored_open_context_bounds_receive_buffer_writes() {
+        const BASE: u64 = 0x1000_0000_0000;
+        let memory = Arc::new(AddressSpace::new());
+        memory.map(BASE, 0x20000, Perm::RW, "account_context_bounds_test").unwrap();
+        let mut kernel = kernel(Arc::clone(&memory), BASE);
+        let mut expected = [0; 0x80];
+        expected[..16].copy_from_slice(&ACCOUNT_UID);
+        for size in [1usize, 15, 16, 32, 0x80, 0xa0] {
+            for static_buffer in [false, true] {
+                memory.write(BASE, &[0xa5; 0xb0]).unwrap();
+                let mut ctx = request(131);
+                let output = IpcBuffer { addr: BASE + 8, size: size as u64, mode: 0 };
+                if static_buffer { ctx.recv_statics.push(output); }
+                else { ctx.recv_buffers.push(output); }
+                let response = dispatch_service_v2(
+                    &mut kernel, "acc:u0", &mut ctx, 0x80, &mut Vec::new());
+                assert_eq!(&response[0x18..0x1c], &0u32.to_le_bytes());
+                let mut actual = [0; 0xb0];
+                memory.read(BASE, &mut actual).unwrap();
+                let written = size.min(expected.len());
+                assert_eq!(&actual[..8], &[0xa5; 8]);
+                assert_eq!(&actual[8..8 + written], &expected[..written]);
+                assert!(actual[8 + written..].iter().all(|byte| *byte == 0xa5));
+            }
+        }
+    }
 }
 
 fn build_igbp_success_parcel() -> Vec<u8> {
@@ -13924,7 +14623,8 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         }
         7 => {
             if kernel.is_application {
-                kernel.code_size + kernel.stack_size + kernel.heap_committed + 0x100_0000
+                kernel.code_size + kernel.stack_size + kernel.heap_committed
+                    + kernel.system_resource_size
             } else {
                 0x40_000_000
             }
@@ -13964,9 +14664,8 @@ fn svc_get_info(kernel: &mut Kernel) -> u32 {
         18 => 0,
         19 => 0,
         20 => kernel.tls_base + 0x200,
-        21 => kernel.total_memory,
-        22 => (kernel.code_size + kernel.stack_size + kernel.heap_committed + 0x100_0000)
-            .min(kernel.total_memory),
+        21 => kernel.total_memory.saturating_sub(kernel.system_resource_size),
+        22 => kernel.code_size + kernel.stack_size + kernel.heap_committed,
 
         23 => u64::from(kernel.is_application),
         24 | 25 | 26 | 27 => 0,
@@ -14025,6 +14724,43 @@ mod process_info_tests {
     use nexium_cpu::Cpu;
     use nexium_memory::AddressSpace;
     use std::sync::Arc;
+
+    #[test]
+    fn process_memory_info_excludes_system_resources_from_non_system_usage() {
+        let mut kernel = Kernel::new(
+            Arc::new(AddressSpace::new()),
+            0x8000000, 0x45db000, 0x1108000000, 0xcc000000,
+            0x11d4000000, 0x100000, 0x1254001000, 0x1254010000,
+        );
+        kernel.is_application = true;
+        kernel.total_memory = 0xcd500000;
+        kernel.system_resource_size = 0x1000000;
+        let mut cpu = Cpu::new_rustarmic().unwrap();
+        let _guard = set_current_cpu(&mut cpu, 0);
+        for committed in [0, 0x59800000] {
+            kernel.heap_committed = committed;
+            for (kind, expected) in [
+                (6, 0xcd500000),
+                (7, 0x56db000 + committed),
+                (16, 0x1000000),
+                (21, 0xcc500000),
+                (22, 0x46db000 + committed),
+            ] {
+                cpu.set_register(1, kind);
+                cpu.set_register(2, 0xffff8001);
+                cpu.set_register(3, 0);
+                assert_eq!(svc_get_info(&mut kernel), SUCCESS);
+                assert_eq!(cpu.get_register(0), u64::from(SUCCESS));
+                assert_eq!(cpu.get_register(1), expected, "GetInfo({kind})");
+            }
+        }
+        kernel.heap_committed = 0;
+        kernel.system_resource_size = 0;
+        cpu.set_register(1, 7);
+        assert_eq!(svc_get_info(&mut kernel), SUCCESS);
+        assert_eq!(cpu.get_register(1), 0x46db000);
+        assert!(cpu.get_register(1) < 0x5500000);
+    }
 
     #[test]
     fn current_process_info_returns_independently_owned_handles() {

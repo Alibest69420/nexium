@@ -246,6 +246,37 @@ pub fn proxy_subsession(port_name: &str, cmd_id: u32) -> Option<&'static str> {
 
 pub const ACCOUNT_UID: [u8; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
+pub(crate) fn dispatch_account_load_open_context(
+    kernel: &mut Kernel,
+    ctx: &mut nexium_ipc::IpcCtx,
+    session_handle: u32,
+    port_name: &str,
+    cmd_id: u32,
+) -> Option<Vec<u8>> {
+    if port_name != "acc:u0" || cmd_id != 130 {
+        return None;
+    }
+    const NULL_ARGUMENT: u32 = 124 | (20 << 9);
+    const INVALID_ARGUMENT: u32 = 124 | (22 << 9);
+    let uid = (ctx.cmif_in_data_len >= 16)
+        .then(|| ctx.cmif_in_data_off.checked_add(16))
+        .flatten()
+        .and_then(|end| ctx.buf.get(ctx.cmif_in_data_off..end));
+    let Some(uid) = uid else {
+        return Some(crate::kernel::svc::build_ipc_response(
+            ctx, INVALID_ARGUMENT, &[], &[],
+        ));
+    };
+    if uid.iter().all(|byte| *byte == 0) {
+        return Some(crate::kernel::svc::build_ipc_response(
+            ctx, NULL_ARGUMENT, &[], &[],
+        ));
+    }
+    Some(crate::kernel::svc::return_subsession(
+        kernel, ctx, session_handle, "IManagerForApplication",
+    ))
+}
+
 pub fn dispatch_command(
     kernel: &mut Kernel,
     port_name: &str,
@@ -998,7 +1029,7 @@ fn account_service(cmd: u32) -> Option<(u32, Vec<u8>, Vec<u32>)> {
     match cmd {
         0 => ok(1u32.to_le_bytes().to_vec()),
         1 => ok(vec![1u8]),
-        2 | 3 => ok_empty(),
+        2 | 3 | 60 | 131 => ok_empty(),
         4 => ok(ACCOUNT_UID.to_vec()),
         100 | 102 | 103 | 110 | 140 | 141 | 160 => ok_empty(),
         150 => ok(vec![0u8]),

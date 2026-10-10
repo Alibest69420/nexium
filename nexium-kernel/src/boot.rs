@@ -29,6 +29,23 @@ impl BootConfig {
     }
 }
 
+fn application_main_stack_size(npdm_size: u32) -> u64 {
+    const PAGE_SIZE: u64 = 0x1000;
+    u64::from(npdm_size).max(PAGE_SIZE).next_multiple_of(PAGE_SIZE)
+}
+
+#[cfg(test)]
+mod application_stack_tests {
+    use super::application_main_stack_size;
+
+    #[test]
+    fn application_main_stack_uses_npdm_size_and_page_alignment() {
+        assert_eq!(application_main_stack_size(0x100000), 0x100000);
+        assert_eq!(application_main_stack_size(0x100001), 0x101000);
+        assert_eq!(application_main_stack_size(0), 0x1000);
+    }
+}
+
 pub struct BootContext {
     pub program: LoadedProgram,
     pub address_space: Arc<AddressSpace>,
@@ -397,6 +414,7 @@ impl BootContext {
         nexium_loader::mods::apply_exefs_mods(&mut app, &mods)?;
         let application_romfs = nexium_loader::mods::build_mod_romfs(&app, &mods)?;
         let address_space = Arc::new(AddressSpace::new());
+        let main_stack_size = application_main_stack_size(app.npdm.main_stack_size);
 
         let a32 = !app.npdm.is_64bit;
         let bits: u32 = match app.npdm.address_space {
@@ -571,10 +589,10 @@ impl BootContext {
         log::info!(
             "  Mapping stack @ {:#x} (size {:#x})",
             stack_base,
-            config.stack_size
+            main_stack_size
         );
         address_space
-            .map(stack_base, config.stack_size, Perm::RW, "stack")
+            .map(stack_base, main_stack_size, Perm::RW, "stack")
             .map_err(|e| format!("Failed to map stack: {:?}", e))?;
 
         log::info!(
@@ -596,7 +614,7 @@ impl BootContext {
             heap_base,
             heap_size,
             stack_base,
-            config.stack_size,
+            main_stack_size,
             tls_base,
             tls_pool_base,
         );
@@ -667,7 +685,7 @@ impl BootContext {
         let main_thread_handle = kernel.main_thread_handle;
         {
             let entry_point = code_base;
-            let sp = stack_base + config.stack_size - 0x20;
+            let sp = stack_base + main_stack_size - 0x20;
             cpu.set_pc(entry_point);
             cpu.set_sp(sp);
             cpu.set_tpidrro_el0(tls_base);
