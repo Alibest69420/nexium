@@ -11,7 +11,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "space-nx-master/space-nx.nro".to_string());
 
-    let log_file = std::fs::File::create("debug_boot.log")?;
+    let log_path = std::env::var("NEXIUM_DEBUG_BOOT_LOG")
+        .unwrap_or_else(|_| "debug_boot.log".to_string());
+    let log_file = std::fs::File::create(&log_path)?;
     let mut log = std::io::BufWriter::new(log_file);
 
     writeln!(log, "=== NeXium Debug Boot ===")?;
@@ -24,8 +26,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("NRO file not found: {}", nro_path).into());
     }
 
-    let config = BootConfig::new(&nro_path);
+    let mut config = BootConfig::new(&nro_path);
+    if let Some(backend) = std::env::args()
+        .nth(2)
+        .or_else(|| std::env::var("NEXIUM_CPU_BACKEND").ok())
+    {
+        config.cpu_backend = match backend.to_ascii_lowercase().as_str() {
+            "rustarmic" => nexium_core::cpu::CpuBackendKind::Rustarmic,
+            "dynarmic" => nexium_core::cpu::CpuBackendKind::Dynarmic,
+            _ => return Err(format!("Unsupported debug CPU backend: {backend}").into()),
+        };
+    }
+    writeln!(log, "CPU backend: {}", config.cpu_backend.label())?;
+    if std::env::args().nth(3).as_deref() == Some("runner") {
+        return run_production_runner(&nro_path, config.cpu_backend, &mut log);
+    }
     let mut boot_ctx = BootContext::new(config)?;
+    let mut mapping_generation = boot_ctx.address_space.generation();
     let mut cpu = boot_ctx
         .cpu
         .take()
@@ -52,10 +69,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log.flush()?;
 
     loop {
-        let mut guard = boot_ctx.kernel.lock();
         if let Some(cpu) = cpu_mut() {
+            let execution_guard = boot_ctx.address_space.execution_guard();
+            nexium_runner::boot::sync_host_region_changes(
+                cpu,
+                &boot_ctx.address_space,
+                &mut mapping_generation,
+                0,
+            )?;
             let pc_before = cpu.get_pc();
             let run = cpu.run_with_count(100_000);
+            drop(execution_guard);
+            let mut guard = boot_ctx.kernel.lock();
             let event = run.event;
             let pc_after = cpu.get_pc();
             cycle_count += run.retired;
@@ -175,6 +200,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writeln!(log, "Total SVCs: {}", svc_count)?;
     log.flush()?;
 
-    println!("Debug boot completed. Check debug_boot.log for details.");
+    println!("Debug boot completed. Check {log_path} for details.");
+    Ok(())
+}
+
+fn run_production_runner(
+    path: &str,
+    backend: nexium_core::cpu::CpuBackendKind,
+    log: &mut impl Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::{Duration, Instant};
+
+    let seconds = std::env::var("NEXIUM_DEBUG_RUNNER_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(45);
+    let mut emulation = nexium_runner::boot::EmulationHandle::new(path, backend, None)?;
+    let start = Instant::now();
+    let mut last_report = Instant::now();
+    let mut frames = 0u64;
+    writeln!(log, "Production runner, timeout={seconds}s")?;
+    log.flush()?;
+    loop {
+        for frame in emulation.frame_rx.try_iter() {
+            frames += 1;
+            if frames <= 3 {
+                writeln!(log, "Frame {frames}: {}x{} pixels={} bytes", frame.width, frame.height, frame.pixels.len())?;
+            }
+        }
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            let stats = emulation.stats.lock().clone();
+            writeln!(
+                log,
+                "Runner elapsed={:.2}s cycles={} svcs={} frames={frames}",
+                start.elapsed().as_secs_f64(),
+                stats.cycle_count,
+                stats.svc_count,
+            )?;
+            log.flush()?;
+            last_report = Instant::now();
+        }
+        if emulation
+            .thread_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            if let Some(handle) = emulation.thread_handle.take() {
+                handle.join().map_err(|_| "Emulation thread panicked")??;
+            }
+            break;
+        }
+        if start.elapsed() >= Duration::from_secs(seconds) {
+            emulation.stop_blocking();
+            writeln!(log, "Runner timeout reached")?;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for frame in emulation.frame_rx.try_iter() {
+        frames += 1;
+        if frames <= 3 {
+            writeln!(log, "Frame {frames}: {}x{} pixels={} bytes", frame.width, frame.height, frame.pixels.len())?;
+        }
+    }
+    writeln!(log, "Production runner complete: frames={frames}")?;
+    log.flush()?;
     Ok(())
 }
