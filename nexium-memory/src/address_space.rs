@@ -1,5 +1,5 @@
 use bytemuck::{NoUninit, Pod};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -290,6 +290,7 @@ struct VersionedHostRegionChange {
 
 pub struct AddressSpace {
     id: u64,
+    execution_map: RwLock<()>,
     regions: Mutex<Vec<Arc<Region>>>,
     host_changes: Mutex<Vec<VersionedHostRegionChange>>,
     generation: AtomicU64,
@@ -299,6 +300,7 @@ impl AddressSpace {
     pub fn new() -> Self {
         Self {
             id: ADDRESS_SPACE_IDS.fetch_add(1, Ordering::Relaxed),
+            execution_map: RwLock::new(()),
             regions: Mutex::new(Vec::new()),
             host_changes: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
@@ -307,6 +309,10 @@ impl AddressSpace {
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn execution_guard(&self) -> RwLockReadGuard<'_, ()> {
+        self.execution_map.read()
     }
 
     pub fn map(&self, va: u64, len: u64, perm: Perm, name: impl Into<String>) -> Result<usize> {
@@ -331,6 +337,7 @@ impl AddressSpace {
         name: String,
         commit: bool,
     ) -> Result<usize> {
+        let _execution_guard = self.execution_map.write();
         check_aligned("va", va)?;
         check_aligned("len", len)?;
         if len == 0 {
@@ -398,6 +405,7 @@ impl AddressSpace {
     }
 
     pub fn map_alias(&self, dst: u64, src: u64, len: u64, perm: Perm, name: impl Into<String>) -> Result<()> {
+        let _execution_guard = self.execution_map.write();
         for (what, value) in [("dst", dst), ("src", src), ("len", len)] {
             check_aligned(what, value)?;
         }
@@ -433,6 +441,7 @@ impl AddressSpace {
     }
 
     pub fn unmap_alias(&self, dst: u64, src: u64, len: u64) -> Result<()> {
+        let _execution_guard = self.execution_map.write();
         for (what, value) in [("dst", dst), ("src", src), ("len", len)] {
             check_aligned(what, value)?;
         }
@@ -493,6 +502,7 @@ impl AddressSpace {
     }
 
     pub fn unmap(&self, va: u64, len: u64) -> Result<u64> {
+        let _execution_guard = self.execution_map.write();
         check_aligned("va", va)?;
         check_aligned("len", len)?;
         if len == 0 {
@@ -573,6 +583,7 @@ impl AddressSpace {
     }
 
     pub fn resize_committed(&self, va: u64, len: u64) -> Result<()> {
+        let _execution_guard = self.execution_map.write();
         check_aligned("va", va)?;
         check_aligned("len", len)?;
 
@@ -621,6 +632,7 @@ impl AddressSpace {
     }
 
     pub fn protect(&self, va: u64, len: u64, perm: Perm) -> Result<()> {
+        let _execution_guard = self.execution_map.write();
         let regs = self.regions.lock();
         let r = regs
             .binary_search_by_key(&va, |r| r.base)
@@ -1924,5 +1936,180 @@ mod tests {
         assert_eq!(span, [1, 2, 3, 4, 5, 6, 7, 8]);
         a.read(BASE + PAGE_SIZE + 2, &mut byte).unwrap();
         assert_eq!(byte, [7]);
+    }
+
+    #[test]
+    fn execution_guard_blocks_every_structural_mapping_mutator() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for mutation in 0..8 {
+            let base = (1u64 << 41) + mutation * 0x10000;
+            let destination = base + PAGE_SIZE * 4;
+            let space = Arc::new(fresh());
+            if mutation >= 6 {
+                space.map_reserved(base, PAGE_SIZE * 3, Perm::RW, "reserved").unwrap();
+                space.resize_committed(base, PAGE_SIZE * if mutation == 6 { 1 } else { 2 }).unwrap();
+            } else {
+                space.map(base, PAGE_SIZE * 2, Perm::RW, "source").unwrap();
+            }
+            if mutation == 3 {
+                space.map_alias(destination, base, PAGE_SIZE, Perm::RW, "alias").unwrap();
+            }
+            space.write(base, &[0xa7]).unwrap();
+            let execution = space.execution_guard();
+            let generation = space.generation();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker_space = Arc::clone(&space);
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = match mutation {
+                    0 => worker_space.map(destination, PAGE_SIZE, Perm::RW, "new").map(|_| ()),
+                    1 => worker_space.map_reserved(destination, PAGE_SIZE * 2, Perm::RW, "new_reserved").map(|_| ()),
+                    2 => worker_space.map_alias(destination, base, PAGE_SIZE, Perm::RW, "new_alias"),
+                    3 => worker_space.unmap_alias(destination, base, PAGE_SIZE),
+                    4 => worker_space.unmap(base + PAGE_SIZE, PAGE_SIZE).map(|_| ()),
+                    5 => worker_space.protect(base, PAGE_SIZE * 2, Perm::R),
+                    6 => worker_space.resize_committed(base, PAGE_SIZE * 2),
+                    7 => worker_space.resize_committed(base, PAGE_SIZE),
+                    _ => unreachable!(),
+                };
+                done_tx.send(result).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(matches!(done_rx.recv_timeout(Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)), "mutation {mutation} crossed execution guard");
+            assert_eq!(space.generation(), generation);
+            let mut byte = [0];
+            space.read(base, &mut byte).unwrap();
+            assert_eq!(byte, [0xa7]);
+            drop(execution);
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+            worker.join().unwrap();
+            match mutation {
+                0 | 1 | 2 => assert!(space.host_region_at(destination).is_some()),
+                3 => assert!(space.host_region_at(destination).is_none()),
+                4 => assert!(space.host_region_at(base + PAGE_SIZE).is_none()),
+                5 => assert_eq!(space.host_region_at(base).unwrap().perm, Perm::R),
+                6 => assert!(space.read(base + PAGE_SIZE, &mut byte).is_ok()),
+                7 => assert!(space.read(base + PAGE_SIZE, &mut byte).is_err()),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn execution_guards_allow_parallel_cpu_readers_and_ordinary_data_writes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let base = (1u64 << 41) + 0x100000;
+        let space = Arc::new(fresh());
+        space.map(base, PAGE_SIZE, Perm::RW, "parallel").unwrap();
+        let first = space.execution_guard();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader_space = Arc::clone(&space);
+        let reader = std::thread::spawn(move || {
+            let _second = reader_space.execution_guard();
+            acquired_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        space.write(base, &[0x63]).unwrap();
+        let mut byte = [0];
+        space.read(base, &mut byte).unwrap();
+        assert_eq!(byte, [0x63]);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_space = Arc::clone(&space);
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            writer_space.unmap(base, PAGE_SIZE).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(done_rx.recv_timeout(Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)));
+        drop(first);
+        assert!(matches!(done_rx.recv_timeout(Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)), "remaining CPU reader must still pin the mapping");
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        reader.join().unwrap();
+        writer.join().unwrap();
+        assert!(space.host_region_at(base).is_none());
+    }
+
+    #[test]
+    fn execution_guard_pins_raw_backing_and_complete_partial_unmap_journal() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let base = (1u64 << 41) + 0x200000;
+        let space = Arc::new(fresh());
+        space.map(base, PAGE_SIZE * 3, Perm::RW, "split").unwrap();
+        space.write(base, &[0x39]).unwrap();
+        let execution = space.execution_guard();
+        let original = space.host_region_at(base).unwrap();
+        let generation = space.generation();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_space = Arc::clone(&space);
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            writer_space.unmap(base + PAGE_SIZE, PAGE_SIZE).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(done_rx.recv_timeout(Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(unsafe { *original.host_ptr }, 0x39);
+        assert_eq!(space.host_region_at(base).unwrap().size, PAGE_SIZE * 3);
+        assert!(space.host_region_changes_since(generation).changes.is_empty());
+        drop(execution);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        writer.join().unwrap();
+        let _next_execution = space.execution_guard();
+        let updates = space.host_region_changes_since(generation);
+        assert_eq!(updates.generation, space.generation());
+        assert_eq!(updates.changes.len(), 3);
+        assert!(matches!(updates.changes[0], HostRegionChange::Remove { base: removed, size } if removed == base && size == PAGE_SIZE * 3));
+        assert!(matches!(&updates.changes[1], HostRegionChange::Upsert(region) if region.base == base && region.size == PAGE_SIZE));
+        assert!(matches!(&updates.changes[2], HostRegionChange::Upsert(region) if region.base == base + PAGE_SIZE * 2 && region.size == PAGE_SIZE));
+        assert!(space.host_region_at(base + PAGE_SIZE).is_none());
+        let mut byte = [0];
+        space.read(base, &mut byte).unwrap();
+        assert_eq!(byte, [0x39]);
+    }
+
+    #[test]
+    fn execution_guard_hides_an_in_progress_change_journal_batch() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let space = Arc::new(fresh());
+        let generation = space.generation();
+        let (prefix_tx, prefix_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let writer_space = Arc::clone(&space);
+        let writer = std::thread::spawn(move || {
+            let _mutation = writer_space.execution_map.write();
+            writer_space.publish_host_change(HostRegionChange::Invalidate { base: 0x1000, size: PAGE_SIZE });
+            prefix_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            writer_space.publish_host_change(HostRegionChange::Invalidate { base: 0x2000, size: PAGE_SIZE });
+        });
+        prefix_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let reader_space = Arc::clone(&space);
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _execution = reader_space.execution_guard();
+            snapshot_tx.send(reader_space.host_region_changes_since(generation)).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(snapshot_rx.recv_timeout(Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)), "CPU must not snapshot the journal prefix");
+        finish_tx.send(()).unwrap();
+        let updates = snapshot_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        writer.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(updates.generation, generation + 2);
+        assert_eq!(updates.changes.len(), 2);
     }
 }

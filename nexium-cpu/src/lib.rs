@@ -274,6 +274,8 @@ impl Cpu {
         match self {
             #[cfg(feature = "backend-dynarmic")]
             Cpu::Dynarmic(_) => Some(dynarmic_sys::host_cntpct()),
+            #[cfg(feature = "backend-rustarmic")]
+            Cpu::Rustarmic(cpu) => Some(cpu.guest_cntpct()),
             #[cfg(nce_runtime)]
             Cpu::Nce(_) => {
                 let counter: u64;
