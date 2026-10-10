@@ -9,6 +9,17 @@ const LLE_WRITE_SCRATCH_LIMIT: usize = 32 * 1024;
 const LLE_PROFILE_SAMPLE_MASK: u64 = 63;
 const LLE_PROFILE_REPORT_MASK: u64 = 1_048_575;
 const LLE_PROFILE_HASH_LIMIT: usize = 128;
+const DEFAULT_LLE_STEP_BUDGET: u32 = 8192;
+const DRAW_INDEXED_LLE_HASH: u64 = 0x771B_B18C_6244_4DA0;
+const DRAW_INDEXED_MAX_EXTENDED_INSTANCES: u32 = 4096;
+const DRAW_INDEXED_LLE_CODE: [u32; 23] = [
+    0x0000_0501, 0x0346_c215, 0x0000_0401, 0x017d_c061,
+    0x0111_8351, 0x0000_1841, 0x0543_4021, 0x0015_1410,
+    0x0000_1a31, 0x0002_e007, 0x0000_1041, 0x0161_8021,
+    0x0000_0841, 0x017e_0021, 0x0000_2841, 0x0161_4071,
+    0xffff_e411, 0x0000_4211, 0xfffe_6017, 0xd080_8912,
+    0x0111_8071, 0x0143_40f1, 0x0143_8071,
+];
 
 fn truthy(value: &str) -> bool {
     matches!(
@@ -65,6 +76,32 @@ fn macro_hash(code: &[u32]) -> u64 {
         h = h.wrapping_add(0xe654_6b64);
     }
     h
+}
+
+fn lle_step_budget(code: &[u32], hash: u64, params: &[u32], reg_reader: &dyn Fn(u32) -> u32) -> (u32, Option<u32>) {
+    if hash != DRAW_INDEXED_LLE_HASH || code != DRAW_INDEXED_LLE_CODE || params.len() != 6 {
+        return (DEFAULT_LLE_STEP_BUDGET, None);
+    }
+    let instances = reg_reader(REG_DRAW_INSTANCE_COUNT) & params[2];
+    if instances > DRAW_INDEXED_MAX_EXTENDED_INSTANCES {
+        return (DEFAULT_LLE_STEP_BUDGET, None);
+    }
+    let Some(budget) = instances.checked_mul(8).and_then(|steps| steps.checked_add(14)) else {
+        return (DEFAULT_LLE_STEP_BUDGET, None);
+    };
+    if budget <= DEFAULT_LLE_STEP_BUDGET {
+        (DEFAULT_LLE_STEP_BUDGET, None)
+    } else {
+        (budget, Some(instances))
+    }
+}
+
+fn report_extended_budget(hash: u64, instances: u32, budget: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
+    if REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {
+        log::info!("[mme-budget] hash={:#018x} instances={} steps={}", hash, instances, budget);
+    }
 }
 
 const REG_GLOBAL_BASE_VERTEX: u32 = 0x50D;
@@ -609,6 +646,23 @@ fn forensic_report(out: &MacroOutput, params: &[u32]) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn report_cap_failure(
+    entry: usize, offset: u32, hash: u64, code: &[u32], params: &[u32],
+    fast: bool, pc: usize, steps: u32, writes: usize, draw_instances: u32,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
+    if REPORTS.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    log::warn!(
+        "[mme-cap] entry={} offset={:#x} hash={:#018x} fast={} pc={:#x} steps={} writes={} draw_instances={} params_len={} params={:08x?} code_len={} code={:08x?}",
+        entry, offset, hash, fast, pc, steps, writes, draw_instances, params.len(),
+        &params[..params.len().min(12)], code.len(), &code[..code.len().min(96)],
+    );
+}
+
 pub struct MacroEngine {
     uploaded_code: HashMap<u32, Vec<u32>>,
     compiled: FastMap<u32, CompiledMacro>,
@@ -800,16 +854,29 @@ impl MacroEngine {
                 .is_some_and(LleProfile::sample_next);
         let started = sample_lle.then(Instant::now);
         let mut lle_stats = None;
+        let (step_budget, extended_instances) = if hle.is_none() {
+            lle_step_budget(code, hash, params, reg_reader)
+        } else {
+            (DEFAULT_LLE_STEP_BUDGET, None)
+        };
+        if let Some(instances) = extended_instances {
+            report_extended_budget(hash, instances, step_budget);
+        }
         let mut out = if let Some(mut out) = hle {
             out.hle = true;
             out
         } else if self.fast_lle {
             let decoded = compiled.decoded.as_deref().unwrap_or_default();
             let scratch = std::mem::take(&mut self.lle_write_scratch);
-            let mut interp = FastInterpreter::new(decoded, params, reg_reader, scratch);
+            let mut interp = FastInterpreter::new(decoded, params, reg_reader, scratch)
+                .with_step_budget(step_budget);
             interp.run();
+            if let Some(writes) = interp.cap_writes {
+                report_cap_failure(entry, offset, hash, code, params, true, interp.pc,
+                    step_budget - interp.steps_remaining, writes, reg_reader(REG_DRAW_INSTANCE_COUNT));
+            }
             if self.lle_profile.is_some() {
-                lle_stats = Some((true, 8192 - interp.steps_remaining, interp.writes.len()));
+                lle_stats = Some((true, step_budget - interp.steps_remaining, interp.writes.len()));
             }
             MacroOutput {
                 writes: interp.writes,
@@ -820,10 +887,15 @@ impl MacroEngine {
                 fast_lle: true,
             }
         } else {
-            let mut interp = Interpreter::new(&code, &params, reg_reader);
+            let mut interp = Interpreter::new(&code, &params, reg_reader)
+                .with_step_budget(step_budget);
             interp.run();
+            if let Some(writes) = interp.cap_writes {
+                report_cap_failure(entry, offset, hash, code, params, false, interp.pc,
+                    step_budget - interp.steps_remaining, writes, reg_reader(REG_DRAW_INSTANCE_COUNT));
+            }
             if self.lle_profile.is_some() {
-                lle_stats = Some((false, 8192 - interp.steps_remaining, interp.writes.len()));
+                lle_stats = Some((false, step_budget - interp.steps_remaining, interp.writes.len()));
             }
             MacroOutput {
                 writes: interp.writes,
@@ -950,6 +1022,7 @@ struct Interpreter<'a> {
     written: HashMap<u32, u32>,
     reg_reader: &'a dyn Fn(u32) -> u32,
     steps_remaining: u32,
+    cap_writes: Option<usize>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -970,8 +1043,14 @@ impl<'a> Interpreter<'a> {
             writes: Vec::new(),
             written: HashMap::new(),
             reg_reader,
-            steps_remaining: 8192,
+            steps_remaining: DEFAULT_LLE_STEP_BUDGET,
+            cap_writes: None,
         }
+    }
+
+    fn with_step_budget(mut self, budget: u32) -> Self {
+        self.steps_remaining = budget;
+        self
     }
 
     fn run(&mut self) {
@@ -984,6 +1063,7 @@ impl<'a> Interpreter<'a> {
             }
         }
         if !exited {
+            self.cap_writes = Some(self.writes.len());
             log::warn!(
                 "MME: macro hit step cap (produced {} writes) — discarding as runaway",
                 self.writes.len()
@@ -1199,6 +1279,7 @@ struct FastInterpreter<'a> {
     writes: Vec<(u32, u32)>,
     reg_reader: &'a dyn Fn(u32) -> u32,
     steps_remaining: u32,
+    cap_writes: Option<usize>,
 }
 
 impl<'a> FastInterpreter<'a> {
@@ -1223,8 +1304,14 @@ impl<'a> FastInterpreter<'a> {
             carry: false,
             writes,
             reg_reader,
-            steps_remaining: 8192,
+            steps_remaining: DEFAULT_LLE_STEP_BUDGET,
+            cap_writes: None,
         }
+    }
+
+    fn with_step_budget(mut self, budget: u32) -> Self {
+        self.steps_remaining = budget;
+        self
     }
 
     fn run(&mut self) {
@@ -1237,6 +1324,7 @@ impl<'a> FastInterpreter<'a> {
             }
         }
         if !exited {
+            self.cap_writes = Some(self.writes.len());
             log::warn!(
                 "MME: macro hit step cap (produced {} writes) — discarding as runaway",
                 self.writes.len()
@@ -1434,6 +1522,10 @@ impl<'a> FastInterpreter<'a> {
         true
     }
 }
+
+#[cfg(test)]
+#[path = "macro_engine_cap_tests.rs"]
+mod cap_tests;
 
 #[cfg(test)]
 mod tests {
