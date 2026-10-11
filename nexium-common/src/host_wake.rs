@@ -1,91 +1,41 @@
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+pub use crate::monitored_futex::{
+    mwaitx_supported, umwait_supported, wait_backend, Futex, WaitBackend, WaitOutcome,
+};
 
 type WakeHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 static HOOK: RwLock<Option<WakeHook>> = RwLock::new(None);
+
+fn event() -> &'static Futex {
+    static EVENT: OnceLock<Futex> = OnceLock::new();
+    EVENT.get_or_init(Futex::new)
+}
 
 pub fn install(hook: WakeHook) {
     *HOOK.write().unwrap() = Some(hook);
 }
 
 pub fn signal() {
+    event().notify_all();
     let hook = HOOK.read().unwrap().clone();
     if let Some(hook) = hook {
         hook();
     }
 }
 
-pub fn mwaitx_supported() -> bool {
-    static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        if std::env::var_os("NEXIUM_NO_MWAITX").is_some() {
-            return false;
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            let leaf = std::arch::x86_64::__cpuid(0x8000_0001);
-            (leaf.ecx & (1 << 29)) != 0
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
-    })
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn monitorx(addr: *const u8) {
-    std::arch::asm!(
-        ".byte 0x0f, 0x01, 0xfa",
-        in("rax") addr,
-        in("ecx") 0u32,
-        in("edx") 0u32,
-        options(nostack)
-    );
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn mwaitx(tsc_timeout: u32) {
-    std::arch::asm!(
-        "mov {saved_rbx}, rbx",
-        "mov ebx, {timeout:e}",
-        ".byte 0x0f, 0x01, 0xfb",
-        "mov rbx, {saved_rbx}",
-        saved_rbx = out(reg) _,
-        timeout = in(reg) tsc_timeout,
-        in("eax") 0u32,
-        in("ecx") 2u32,
-        options(nostack)
-    );
-}
-
-const MWAITX_TSC_TIMEOUT: u32 = 100_000;
-
 pub fn micro_pause() {
-    #[cfg(target_arch = "x86_64")]
-    if mwaitx_supported() {
-        let sentinel = 0u64;
-        unsafe {
-            monitorx(&sentinel as *const u64 as *const u8);
-            mwaitx(MWAITX_TSC_TIMEOUT);
-        }
-        return;
-    }
-    for _ in 0..64 {
-        std::hint::spin_loop();
-    }
+    let event = event();
+    event.poll_pause(event.generation());
 }
 
 pub fn wait_until(deadline: Instant) {
+    let event = event();
     while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining > Duration::from_micros(60) {
-            micro_pause();
-        } else {
-            std::hint::spin_loop();
-        }
+        let _ = event.wait_until(event.generation(), deadline);
     }
 }
 
@@ -93,6 +43,7 @@ pub fn wait_until(deadline: Instant) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn signal_without_hook_is_noop_and_hook_fires_after_install() {
@@ -120,5 +71,40 @@ mod tests {
         let deadline = Instant::now() + Duration::from_micros(300);
         wait_until(deadline);
         assert!(Instant::now() >= deadline);
+    }
+
+    #[test]
+    fn micro_pause_wakes_on_the_host_wake_event() {
+        if wait_backend() != WaitBackend::Mwaitx {
+            return;
+        }
+        let _timing = crate::monitored_futex::serialize_timing_test();
+        let result = crate::monitored_futex::median_below(5, Duration::from_micros(5), || {
+            (0..11)
+                .map(|_| {
+                    let expected = event().generation();
+                    let base = Instant::now();
+                    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let waiter = {
+                        let ready = std::sync::Arc::clone(&ready);
+                        std::thread::spawn(move || {
+                            ready.store(true, Ordering::Release);
+                            while event().generation() == expected {
+                                micro_pause();
+                            }
+                            base.elapsed()
+                        })
+                    };
+                    while !ready.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    std::thread::sleep(Duration::from_millis(3));
+                    let notified = base.elapsed();
+                    event().notify_all();
+                    waiter.join().unwrap().saturating_sub(notified)
+                })
+                .collect()
+        });
+        assert!(result.is_ok(), "{result:?}");
     }
 }
