@@ -47,6 +47,10 @@ replace(cpp, "{ dynarmic->page_table[idx] = (void*)((uintptr_t)current_ptr - vad
 replace(cpp, "    size_t size = (1ULL << (PAGE_TABLE_ADDRESS_SPACE_BITS - DYN_PAGE_BITS)) * sizeof(void *);\n#ifdef MAP_NORESERVE",
         "    size_t size = (1ULL << (PAGE_TABLE_ADDRESS_SPACE_BITS - DYN_PAGE_BITS)) * sizeof(void *);\n"
         "#if defined(__PROSPERO__)\n    return ps5_page_table_create(size);\n#endif\n#ifdef MAP_NORESERVE")
+replace(cpp, "    if (page_table) munmap(page_table, (1ULL << (PAGE_TABLE_ADDRESS_SPACE_BITS - DYN_PAGE_BITS)) * sizeof(void *));\n",
+        "#if defined(__PROSPERO__)\n    (void)page_table;\n#else\n"
+        "    if (page_table) munmap(page_table, (1ULL << (PAGE_TABLE_ADDRESS_SPACE_BITS - DYN_PAGE_BITS)) * sizeof(void *));\n"
+        "#endif\n")
 
 boc = dyn / "backend/x64/block_of_code.cpp"
 replace(boc, "    bool useProtect() const override { return false; }\n#else\n    static constexpr size_t DYNARMIC_PAGE_SIZE = 4096;",

@@ -17,8 +17,8 @@ fetch_crate() {
 }
 
 mkdir -p "$PS5_DEPS"
-fetch_crate dynarmic-sys-mythrax 0.3.5 d0d11c2cc79c1d53decb3f56f2c7bcc9ab9d2b159a134f75bd9fd83a2e771f95
-python3 "$ps5_dir/patches/patch_dynarmic.py" "$PS5_DEPS/dynarmic-sys-mythrax-0.3.5" "$ps5_dir/patches/ps5_page_table.inc"
+fetch_crate dynarmic-sys-mythrax 0.3.6 8c3ddd917c07ab909696689ed72512f44bfa4af9b4a4d91c1f51e7eb69cfc394
+python3 "$ps5_dir/patches/patch_dynarmic.py" "$PS5_DEPS/dynarmic-sys-mythrax-0.3.6" "$ps5_dir/patches/ps5_page_table.inc"
 fetch_crate memmap2 0.9.11 d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0
 python3 "$ps5_dir/patches/patch_memmap2.py" "$PS5_DEPS/memmap2-0.9.11"
 stamp=$(cat "$ps5_dir"/patches/*.py "$ps5_dir"/patches/*.inc | sha256sum | cut -d' ' -f1)

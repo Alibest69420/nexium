@@ -33,9 +33,9 @@ export CMAKE_TOOLCHAIN_FILE_x86_64_nexium_ps5="$ps5_dir/tools/ps5-toolchain.cmak
 export CMAKE_GENERATOR=Ninja
 
 bash "$ps5_dir/tools/patch-rust-src.sh"
-dynarmic="$PS5_DEPS/dynarmic-sys-mythrax-0.3.5"
+dynarmic="$PS5_DEPS/dynarmic-sys-mythrax-0.3.6"
 stamp=$(cat "$ps5_dir"/patches/*.py "$ps5_dir"/patches/*.inc | sha256sum | cut -d' ' -f1)
-if [[ ! -f $PS5_DEPS/.ps5-patch-stamp || $(< "$PS5_DEPS/.ps5-patch-stamp") != "$stamp" ]]; then
+if [[ ! -d $dynarmic || ! -f $PS5_DEPS/.ps5-patch-stamp || $(< "$PS5_DEPS/.ps5-patch-stamp") != "$stamp" ]]; then
     bash "$ps5_dir/tools/prepare-deps.sh"
 fi
 feature_args=()
