@@ -9,27 +9,27 @@ pub const NUM_CORES: usize = 4;
 pub const HOS_PREEMPTION_PRIORITIES: [i32; NUM_CORES] = [59, 59, 59, 63];
 
 pub struct CoreWakers {
-    condvars: [parking_lot::Condvar; NUM_CORES],
+    wakes: [nexium_common::host_wake::Futex; NUM_CORES],
 }
 
 impl CoreWakers {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            condvars: std::array::from_fn(|_| parking_lot::Condvar::new()),
+            wakes: std::array::from_fn(|_| nexium_common::host_wake::Futex::new()),
         })
     }
 
     pub fn notify_core(&self, core: i32) {
         if (0..NUM_CORES as i32).contains(&core) {
-            self.condvars[core as usize].notify_one();
+            self.wakes[core as usize].notify_all();
         } else {
             self.notify_all_cores();
         }
     }
 
     pub fn notify_all_cores(&self) {
-        for condvar in &self.condvars {
-            condvar.notify_one();
+        for wake in &self.wakes {
+            wake.notify_all();
         }
     }
 
@@ -39,8 +39,25 @@ impl CoreWakers {
         core: usize,
         timeout: std::time::Duration,
     ) {
-        if core < NUM_CORES {
-            self.condvars[core].wait_for(guard, timeout);
+        if let Some(wake) = self.wakes.get(core) {
+            let generation = wake.generation();
+            parking_lot::MutexGuard::unlocked(guard, || {
+                let _ = wake.wait(generation, timeout);
+            });
+        }
+    }
+
+    pub fn park_core_until<T>(
+        &self,
+        guard: &mut parking_lot::MutexGuard<'_, T>,
+        core: usize,
+        deadline: Instant,
+    ) {
+        if let Some(wake) = self.wakes.get(core) {
+            let generation = wake.generation();
+            parking_lot::MutexGuard::unlocked(guard, || {
+                let _ = wake.wait_until(generation, deadline);
+            });
         }
     }
 }
@@ -861,13 +878,90 @@ impl Default for Threads {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_create_thread_core, ThreadCtx, ThreadState, Threads, IDEAL_CORE_DONT_CARE,
-        IDEAL_CORE_NO_UPDATE, IDEAL_CORE_USE_PROCESS_VALUE,
+        resolve_create_thread_core, CoreWakers, ThreadCtx, ThreadState, Threads,
+        IDEAL_CORE_DONT_CARE, IDEAL_CORE_NO_UPDATE, IDEAL_CORE_USE_PROCESS_VALUE, NUM_CORES,
     };
     use nexium_common::result::{
         KERNEL_INVALID_COMBINATION, KERNEL_INVALID_CORE_ID, KERNEL_INVALID_HANDLE,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn core_wakers_notify_selected_core_and_broadcast_generations() {
+        let wakers = CoreWakers::new();
+        let original: [u32; NUM_CORES] = std::array::from_fn(|core| wakers.wakes[core].generation());
+        wakers.notify_core(2);
+        for core in 0..NUM_CORES {
+            assert_eq!(
+                wakers.wakes[core].generation(),
+                original[core].wrapping_add(u32::from(core == 2)),
+            );
+        }
+        wakers.notify_all_cores();
+        for core in 0..NUM_CORES {
+            assert_eq!(
+                wakers.wakes[core].generation(),
+                original[core].wrapping_add(1 + u32::from(core == 2)),
+            );
+        }
+        wakers.notify_core(-1);
+        for core in 0..NUM_CORES {
+            assert_eq!(
+                wakers.wakes[core].generation(),
+                original[core].wrapping_add(2 + u32::from(core == 2)),
+            );
+        }
+    }
+
+    #[test]
+    fn core_wakers_release_mutex_publish_ready_and_reacquire_without_lost_wake() {
+        let mutex = std::sync::Arc::new(parking_lot::Mutex::new(false));
+        let wakers = CoreWakers::new();
+        let mut guard = mutex.lock();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = {
+            let mutex = std::sync::Arc::clone(&mutex);
+            let wakers = std::sync::Arc::clone(&wakers);
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let mut ready = mutex.lock();
+                *ready = true;
+                wakers.notify_core(1);
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        wakers.park_core(&mut guard, 1, Duration::from_secs(4));
+        assert!(*guard);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(mutex.try_lock().is_none());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn core_wakers_timeout_preserves_guard_and_invalid_core_does_not_wait() {
+        let mutex = parking_lot::Mutex::new(0x1234u32);
+        let wakers = CoreWakers::new();
+        let mut guard = mutex.lock();
+        let started = Instant::now();
+        wakers.park_core(&mut guard, 0, Duration::from_millis(2));
+        assert!(started.elapsed() >= Duration::from_millis(2));
+        let deadline = Instant::now() + Duration::from_millis(2);
+        wakers.park_core_until(&mut guard, 0, deadline);
+        assert!(Instant::now() >= deadline);
+        assert_eq!(*guard, 0x1234);
+        assert!(mutex.try_lock().is_none());
+        let generations: [u32; NUM_CORES] = std::array::from_fn(|core| wakers.wakes[core].generation());
+        let started = Instant::now();
+        wakers.park_core(&mut guard, NUM_CORES, Duration::from_secs(4));
+        wakers.park_core_until(&mut guard, NUM_CORES, Instant::now() + Duration::from_secs(4));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(*guard, 0x1234);
+        assert!(mutex.try_lock().is_none());
+        for core in 0..NUM_CORES {
+            assert_eq!(wakers.wakes[core].generation(), generations[core]);
+        }
+    }
 
     fn add_ready_thread(threads: &mut Threads, handle: u32, priority: i32) {
         threads.add_thread(handle, ThreadCtx::zero(), 0, 0, 0);
