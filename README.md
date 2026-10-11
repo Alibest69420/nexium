@@ -45,14 +45,15 @@ Work in progress and rough. Homebrew is the main focus right now; commercial tit
 
 You'll need Rust 1.85+ and a C/C++ toolchain with CMake and Ninja (SDL3 builds from source, and the Dynarmic backend is C++). On Linux, also install the dev packages for GTK3, ALSA, udev, X11/Wayland, and libxkbcommon.
 
-NeXium expects rustarmic checked out next to it:
+Rustarmic is a git submodule, so clone with `--recursive`:
 
 ```sh
-git clone https://github.com/nexium-emu/nexium.git
-git clone https://github.com/nexium-emu/rustarmic.git
+git clone --recursive https://github.com/nexium-emu/nexium.git
 cd nexium
 cargo run --release -p nexium-gui --no-default-features --features backend-rustarmic -- /path/to/app.nro
 ```
+
+In a clone made without `--recursive`, run `git submodule update --init`. Run `git submodule update` again after a pull that moves Rustarmic to a new commit.
 
 Drop the `--no-default-features --features backend-rustarmic` flags to build both CPU backends (that also compiles the C++ Dynarmic JIT). Run with no path to open the UI.
 
