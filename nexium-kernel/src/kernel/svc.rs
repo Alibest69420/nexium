@@ -1053,6 +1053,42 @@ mod audio_pcm_tests {
         }
     }
 
+    const V1_VOICE_LAYOUT_REVISION: u32 = 14;
+
+    fn v1_voice_layout_renderer_state() -> super::AudioRendererState {
+        use super::audren_behavior::{check_feature_supported, encode_revision, SupportTags};
+
+        assert!(!check_feature_supported(
+            SupportTags::VoiceInParameterV2,
+            V1_VOICE_LAYOUT_REVISION
+        ));
+        super::AudioRendererState {
+            sample_rate: 48_000,
+            sample_count: 240,
+            mix_buffer_count: 0,
+            voice_count: 0,
+            sink_count: 0,
+            effect_count: 0,
+            revision: encode_revision(V1_VOICE_LAYOUT_REVISION),
+            revision_num: V1_VOICE_LAYOUT_REVISION,
+            state: 1,
+            rendering_time_limit: 100,
+            voice_drop_param: 1.0,
+            effect_states: Vec::new(),
+            voice_played_samples: Vec::new(),
+            voice_wbufs_consumed: Vec::new(),
+            voice_last_wb_index: Vec::new(),
+            voice_wb_progress_frames: Vec::new(),
+            voice_frac_q15: Vec::new(),
+            voice_prev_gain: Vec::new(),
+            voice_prev_routing: Vec::new(),
+            routing: Default::default(),
+            voice_biquad_state: Vec::new(),
+            voice_hist: Vec::new(),
+            voice_adpcm_states: Vec::new(),
+        }
+    }
+
     fn renderer_request_fixture(pitch: f32) -> (super::Kernel, nexium_ipc::IpcCtx) {
         use nexium_memory::{AddressSpace, Perm};
         use std::sync::Arc;
@@ -1080,7 +1116,7 @@ mod audio_pcm_tests {
         address_space.write(BASE, &input).unwrap();
         let pcm: Vec<u8> = (0..8192i16).flat_map(i16::to_le_bytes).collect();
         address_space.write(BASE + 0x10000, &pcm).unwrap();
-        let kernel = super::Kernel::new(
+        let mut kernel = super::Kernel::new(
             address_space,
             BASE,
             0x1000,
@@ -1091,6 +1127,9 @@ mod audio_pcm_tests {
             BASE + 0x19000,
             BASE + 0x1A000,
         );
+        kernel
+            .audio_renderers
+            .insert((0x80, 0), v1_voice_layout_renderer_state());
         let mut request = vec![0u8; 0x100];
         request[0..4].copy_from_slice(&4u32.to_le_bytes());
         request[4..8].copy_from_slice(&6u32.to_le_bytes());
@@ -1618,6 +1657,61 @@ mod audio_pcm_tests {
         assert_eq!(state.voice_played_samples[0], 3840);
         assert_eq!(state.voice_wb_progress_frames[0], 3840);
         assert_eq!(state.voice_hist[0][0], 3839.0 / 32768.0);
+    }
+
+    #[test]
+    fn rev15_renderer_reads_voices_at_the_v2_parameter_stride() {
+        use super::audren_behavior::{check_feature_supported, SupportTags, CURRENT_REVISION};
+        use super::{VOICE_IN_PARAMETER_SIZE, VOICE_IN_PARAMETER_V2_SIZE};
+
+        let (mut kernel, mut ctx) = renderer_request_fixture(1.0);
+        kernel.audio_renderers.remove(&(0x80, 0));
+        let base = ctx.send_buffers[0].addr;
+        let mut v1 = [0u8; VOICE_IN_PARAMETER_SIZE];
+        kernel.address_space.read(base + 0x40, &mut v1).unwrap();
+        let mut v2 = [0u8; VOICE_IN_PARAMETER_V2_SIZE];
+        v2[..0x24].copy_from_slice(&v1[..0x24]);
+        for filter in 0..2 {
+            let from = 0x24 + filter * 0xC;
+            let to = 0x24 + filter * 0x18;
+            v2[to] = v1[from];
+            for coefficient in 0..5 {
+                let at = from + 2 + coefficient * 2;
+                let fixed = i16::from_le_bytes([v1[at], v1[at + 1]]);
+                v2[to + 4 + coefficient * 4..to + 8 + coefficient * 4]
+                    .copy_from_slice(&(fixed as f32 / 16384.0).to_le_bytes());
+            }
+        }
+        v2[0x54..0x58].copy_from_slice(&v1[0x3C..0x40]);
+        v2[0x58..0x5A].copy_from_slice(&v1[0x40..0x42]);
+        v2[0x60..0x78].copy_from_slice(&v1[0x48..0x60]);
+        v2[0x78..0x170].copy_from_slice(&v1[0x60..0x158]);
+        v2[0x170..0x172].copy_from_slice(&v1[0x158..0x15A]);
+        v2[0x174] = v1[0x15C];
+        v2[0x176] = v1[0x15E];
+        assert_eq!(super::voice_in_parameter_v2_to_v1(&v2), v1);
+        let voices_size = (VOICE_IN_PARAMETER_V2_SIZE as u32).to_le_bytes();
+        kernel
+            .address_space
+            .write(base + 0x0C, &voices_size)
+            .unwrap();
+        kernel.address_space.write(base + 0x40, &v2).unwrap();
+        ctx.send_buffers[0].size = (0x40 + VOICE_IN_PARAMETER_V2_SIZE) as u64;
+        update_renderer(&mut kernel, &mut ctx);
+        let state = &kernel.audio_renderers[&(0x80, 0)];
+        assert_eq!(state.revision_num, CURRENT_REVISION);
+        assert!(check_feature_supported(
+            SupportTags::VoiceInParameterV2,
+            state.revision_num
+        ));
+        assert_eq!(state.voice_played_samples, [1920]);
+        assert_eq!(state.voice_wb_progress_frames[0], 1920);
+        assert_eq!(state.voice_hist[0][0], 1919.0 / 32768.0);
+        let mut expected_filter = 0.0f32;
+        for sample in 0..1920 {
+            expected_filter = (sample as f32 / 32768.0 + expected_filter) * (16383.0 / 16384.0);
+        }
+        assert!((state.voice_biquad_state[0][0][0][0] - expected_filter).abs() < 0.0001);
     }
 
     #[test]
