@@ -120,6 +120,35 @@ fn core_park_enabled() -> bool {
     *VALUE.get_or_init(|| std::env::var("NEXIUM_CORE_PARK").ok().as_deref() != Some("0"))
 }
 
+fn wait_for_vsync_deadline(
+    stop: &AtomicBool,
+    wake: &nexium_common::host_wake::Futex,
+    deadline: std::time::Instant,
+) -> bool {
+    let generation = wake.generation();
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
+    let _ = wake.wait_until(generation, deadline);
+    !stop.load(Ordering::Acquire)
+}
+
+struct VsyncGuard(
+    Arc<AtomicBool>,
+    Arc<nexium_common::host_wake::Futex>,
+    Option<thread::JoinHandle<()>>,
+);
+
+impl Drop for VsyncGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+        self.1.notify_all();
+        if let Some(handle) = self.2.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HosTimesliceMode {
     Disabled,
@@ -1242,9 +1271,11 @@ impl EmulationHandle {
                     }));
                 }
                 let vsync_stop = Arc::new(AtomicBool::new(false));
+                let vsync_wake = Arc::new(nexium_common::host_wake::Futex::new());
                 let vsync_handle = {
                     let kernel_v = Arc::clone(&boot_ctx.kernel);
                     let stop_v = Arc::clone(&vsync_stop);
+                    let wake_v = Arc::clone(&vsync_wake);
                     thread::Builder::new()
                         .name("nexium-vsync".into())
                         .spawn(move || {
@@ -1254,11 +1285,8 @@ impl EmulationHandle {
                             while !stop_v.load(Ordering::Relaxed) {
                                 let now = std::time::Instant::now();
                                 if now < next {
-                                    let rem = next - now;
-                                    if rem > std::time::Duration::from_millis(2) {
-                                        thread::sleep(rem - std::time::Duration::from_millis(1));
-                                    } else {
-                                        nexium_common::host_wake::wait_until(next);
+                                    if !wait_for_vsync_deadline(&stop_v, &wake_v, next) {
+                                        break;
                                     }
                                     continue;
                                 }
@@ -1277,16 +1305,11 @@ impl EmulationHandle {
                         })
                         .ok()
                 };
-                struct VsyncGuard(Arc<AtomicBool>, Option<thread::JoinHandle<()>>);
-                impl Drop for VsyncGuard {
-                    fn drop(&mut self) {
-                        self.0.store(true, Ordering::Relaxed);
-                        if let Some(h) = self.1.take() {
-                            let _ = h.join();
-                        }
-                    }
-                }
-                let _vsync_guard = VsyncGuard(Arc::clone(&vsync_stop), vsync_handle);
+                let _vsync_guard = VsyncGuard(
+                    Arc::clone(&vsync_stop),
+                    Arc::clone(&vsync_wake),
+                    vsync_handle,
+                );
 
                 log::info!("Starting emulation loop");
                 let max_cycles = u64::MAX;
@@ -1586,8 +1609,9 @@ impl EmulationHandle {
                             });
                             match near {
                                 Some(wake) => {
+                                    let wakers = guard.threads.wakers.clone();
+                                    wakers.park_core_until(&mut guard, 0, wake);
                                     drop(guard);
-                                    nexium_common::host_wake::wait_until(wake);
                                 }
                                 None => {
                                     let timeout = wake_opt
@@ -2566,6 +2590,52 @@ impl Drop for EmulationHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vsync_wait_preserves_deadline_and_observes_prior_cancellation() {
+        let stop = AtomicBool::new(false);
+        let wake = nexium_common::host_wake::Futex::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+        assert!(wait_for_vsync_deadline(&stop, &wake, deadline));
+        assert!(std::time::Instant::now() >= deadline);
+        stop.store(true, Ordering::Release);
+        wake.notify_all();
+        let started = std::time::Instant::now();
+        assert!(!wait_for_vsync_deadline(
+            &stop,
+            &wake,
+            std::time::Instant::now() + std::time::Duration::from_secs(4),
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn vsync_guard_drop_cancels_wait_and_joins_its_thread() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(nexium_common::host_wake::Futex::new());
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = {
+            let stop = Arc::clone(&stop);
+            let wake = Arc::clone(&wake);
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = wait_for_vsync_deadline(
+                    &stop,
+                    &wake,
+                    std::time::Instant::now() + std::time::Duration::from_secs(4),
+                );
+                finished_tx.send(result).unwrap();
+            })
+        };
+        started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let guard = VsyncGuard(Arc::clone(&stop), Arc::clone(&wake), Some(thread));
+        let started = std::time::Instant::now();
+        drop(guard);
+        assert!(stop.load(Ordering::Acquire));
+        assert!(!finished_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
 
     #[test]
     fn auxiliary_stall_policy_preserves_nonfatal_cpu_events() {
