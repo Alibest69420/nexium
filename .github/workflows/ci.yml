@@ -9,8 +9,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-  RUSTARMIC_URL: https://github.com/nexium-emu/rustarmic.git
-  RUSTARMIC_REF: main
   FFMPEG_VERSION: 9.0.1
   FFMPEG_SOURCE_SHA256: cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635
   FFMPEG_SIGNING_FINGERPRINT: FCF986EA15E6E293A5644F10B4322F04D67658D8
@@ -39,13 +37,15 @@ jobs:
           RUSTARMIC_TOKEN: ${{ secrets.RUSTARMIC_TOKEN }}
         run: |
           export GIT_TERMINAL_PROMPT=0
-          rm -rf ../rustarmic
+          commit=$(git rev-parse HEAD:rustarmic)
+          url=$(git config -f .gitmodules submodule.rustarmic.url)
           if [ -n "$RUSTARMIC_TOKEN" ]; then
-            git clone --depth 1 --branch "$RUSTARMIC_REF" \
-              "https://x-access-token:${RUSTARMIC_TOKEN}@github.com/nexium-emu/rustarmic.git" ../rustarmic
-          else
-            git clone --depth 1 --branch "$RUSTARMIC_REF" "$RUSTARMIC_URL" ../rustarmic
+            url="https://x-access-token:${RUSTARMIC_TOKEN}@${url#https://}"
           fi
+          rm -rf rustarmic
+          git init -q rustarmic
+          git -C rustarmic fetch -q --depth 1 "$url" "$commit"
+          git -C rustarmic checkout -q FETCH_HEAD
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -207,9 +207,10 @@ jobs:
 
       - name: Stub rustarmic (optional path dependency, not built for Android)
         run: |
-          mkdir -p ../rustarmic/src
-          printf '[package]\nname = "rustarmic"\nversion = "0.1.0"\nedition = "2021"\n' > ../rustarmic/Cargo.toml
-          : > ../rustarmic/src/lib.rs
+          rm -rf rustarmic
+          mkdir -p rustarmic/src
+          printf '[package]\nname = "rustarmic"\nversion = "0.1.0"\nedition = "2021"\n' > rustarmic/Cargo.toml
+          : > rustarmic/src/lib.rs
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -365,13 +366,15 @@ jobs:
           RUSTARMIC_TOKEN: ${{ secrets.RUSTARMIC_TOKEN }}
         run: |
           export GIT_TERMINAL_PROMPT=0
-          rm -rf ../rustarmic
+          commit=$(git rev-parse HEAD:rustarmic)
+          url=$(git config -f .gitmodules submodule.rustarmic.url)
           if [ -n "$RUSTARMIC_TOKEN" ]; then
-            git clone --depth 1 --branch "$RUSTARMIC_REF" \
-              "https://x-access-token:${RUSTARMIC_TOKEN}@github.com/nexium-emu/rustarmic.git" ../rustarmic
-          else
-            git clone --depth 1 --branch "$RUSTARMIC_REF" "$RUSTARMIC_URL" ../rustarmic
+            url="https://x-access-token:${RUSTARMIC_TOKEN}@${url#https://}"
           fi
+          rm -rf rustarmic
+          git init -q rustarmic
+          git -C rustarmic fetch -q --depth 1 "$url" "$commit"
+          git -C rustarmic checkout -q FETCH_HEAD
 
       - name: Locate PS5 stack
         shell: bash
