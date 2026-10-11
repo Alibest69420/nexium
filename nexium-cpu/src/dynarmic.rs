@@ -33,6 +33,12 @@ pub struct DynarmicCpu {
 unsafe impl Send for DynarmicCpu {}
 unsafe impl Sync for DynarmicCpu {}
 
+impl Drop for DynarmicCpu {
+    fn drop(&mut self) {
+        self.emu.emu.destroy_callback();
+    }
+}
+
 unsafe extern "C" fn a32_cp15_send_one_word(
     _user: *mut std::ffi::c_void,
     _two: bool,
