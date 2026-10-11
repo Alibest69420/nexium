@@ -84,6 +84,21 @@ jobs:
         shell: bash
         run: cargo build --release -p nexium-gui --bin nexium
 
+      - name: Test NeXium
+        shell: bash
+        timeout-minutes: 30
+        env:
+          NEXIUM_DATA_ROOT: ${{ runner.temp }}/nexium-test-data
+        run: cargo test --release --workspace --no-fail-fast
+
+      - name: Test NeXium libraries with OS waits
+        shell: bash
+        timeout-minutes: 10
+        env:
+          NEXIUM_DATA_ROOT: ${{ runner.temp }}/nexium-test-data
+          NEXIUM_NO_MONITORED_WAIT: "1"
+        run: cargo test --release --workspace --lib --no-fail-fast
+
       - name: Configure MSVC for FFmpeg
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
