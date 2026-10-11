@@ -1,0 +1,3 @@
+[submodule "rustarmic"]
+	path = rustarmic
+	url = https://github.com/nexium-emu/rustarmic.git

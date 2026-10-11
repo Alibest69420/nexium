@@ -19,6 +19,7 @@ members = [
     "nexium-android",
     "nexium-ps5",
 ]
+exclude = ["rustarmic"]
 
 [workspace.package]
 edition = "2021"
