@@ -30,22 +30,8 @@ jobs:
     steps:
       - name: Checkout NeXium
         uses: actions/checkout@v7
-
-      - name: Fetch rustarmic (CPU JIT dependency)
-        shell: bash
-        env:
-          RUSTARMIC_TOKEN: ${{ secrets.RUSTARMIC_TOKEN }}
-        run: |
-          export GIT_TERMINAL_PROMPT=0
-          commit=$(git rev-parse HEAD:rustarmic)
-          url=$(git config -f .gitmodules submodule.rustarmic.url)
-          if [ -n "$RUSTARMIC_TOKEN" ]; then
-            url="https://x-access-token:${RUSTARMIC_TOKEN}@${url#https://}"
-          fi
-          rm -rf rustarmic
-          git init -q rustarmic
-          git -C rustarmic fetch -q --depth 1 "$url" "$commit"
-          git -C rustarmic checkout -q FETCH_HEAD
+        with:
+          submodules: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -204,13 +190,8 @@ jobs:
     steps:
       - name: Checkout NeXium
         uses: actions/checkout@v7
-
-      - name: Stub rustarmic (optional path dependency, not built for Android)
-        run: |
-          rm -rf rustarmic
-          mkdir -p rustarmic/src
-          printf '[package]\nname = "rustarmic"\nversion = "0.1.0"\nedition = "2021"\n' > rustarmic/Cargo.toml
-          : > rustarmic/src/lib.rs
+        with:
+          submodules: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -359,22 +340,8 @@ jobs:
     steps:
       - name: Checkout NeXium
         uses: actions/checkout@v7
-
-      - name: Fetch rustarmic (CPU JIT dependency)
-        shell: bash
-        env:
-          RUSTARMIC_TOKEN: ${{ secrets.RUSTARMIC_TOKEN }}
-        run: |
-          export GIT_TERMINAL_PROMPT=0
-          commit=$(git rev-parse HEAD:rustarmic)
-          url=$(git config -f .gitmodules submodule.rustarmic.url)
-          if [ -n "$RUSTARMIC_TOKEN" ]; then
-            url="https://x-access-token:${RUSTARMIC_TOKEN}@${url#https://}"
-          fi
-          rm -rf rustarmic
-          git init -q rustarmic
-          git -C rustarmic fetch -q --depth 1 "$url" "$commit"
-          git -C rustarmic checkout -q FETCH_HEAD
+        with:
+          submodules: true
 
       - name: Locate PS5 stack
         shell: bash
