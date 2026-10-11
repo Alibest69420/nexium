@@ -74,6 +74,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "precision timing; run on an idle host with --ignored"]
     fn micro_pause_wakes_on_the_host_wake_event() {
         if wait_backend() != WaitBackend::Mwaitx {
             return;

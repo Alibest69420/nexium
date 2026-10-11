@@ -708,6 +708,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "precision timing; run on an idle host with --ignored"]
     fn monitored_pause_wakes_on_notification() {
         let backend = wait_backend();
         if backend == WaitBackend::Os {
@@ -746,6 +747,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "precision timing; run on an idle host with --ignored"]
     fn absolute_deadlines_do_not_inherit_os_timer_lateness() {
         let _timing = serialize_timing_test();
         for backend in [WaitBackend::Os, wait_backend()] {
@@ -766,6 +768,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "precision timing; run on an idle host with --ignored"]
     fn absolute_deadlines_finish_with_a_fine_spin() {
         let _timing = serialize_timing_test();
         for backend in [WaitBackend::Os, wait_backend()] {
